@@ -34,17 +34,17 @@ uvicorn app.main:app --reload
 
 ## API 一览
 
-| 方法     | 路径                                 | 功能                                                         |
-| -------- | ------------------------------------ | ------------------------------------------------------------ |
-| POST     | /api/tasks/upload                    | 上传 zip/apk/二进制创建任务（SHA-256 去重，重复返回 409）    |
-| GET      | /api/tasks                           | 任务列表                                                     |
-| GET      | /api/tasks/{id}                      | 任务详情                                                     |
-| GET      | /api/tasks/{id}/report               | 下载审计报告                                                 |
-| POST     | /api/tasks/{id}/stop                 | 停止任务（立即销毁沙箱容器）                                 |
-| DELETE   | /api/tasks/{id}                      | 删除任务（彻底清理漏洞/上传/工作区/报告）                    |
-| POST     | /api/tasks/{id}/poc-test             | 手工验证：在保留的沙箱容器内发起 payload 请求并回显          |
-| GET      | /api/tasks/{id}/poc-script/{vuln_id} | 下载独立可运行的 Python POC 脚本                             |
-| GET/POST | /api/config                          | 获取 / 更新 LLM 配置（base_url / api_key / model，任意 OpenAI 兼容接口） |
+| 方法 | 路径 | 功能 |
+|---|---|---|
+| POST | /api/tasks/upload | 上传 zip/apk/二进制创建任务（SHA-256 去重，重复返回 409） |
+| GET | /api/tasks | 任务列表 |
+| GET | /api/tasks/{id} | 任务详情 |
+| GET | /api/tasks/{id}/report | 下载审计报告 |
+| POST | /api/tasks/{id}/stop | 停止任务（立即销毁沙箱容器） |
+| DELETE | /api/tasks/{id} | 删除任务（彻底清理漏洞/上传/工作区/报告） |
+| POST | /api/tasks/{id}/poc-test | 手工验证：在保留的沙箱容器内发起 payload 请求并回显 |
+| GET | /api/tasks/{id}/poc-script/{vuln_id} | 下载独立可运行的 Python POC 脚本 |
+| GET/POST | /api/config | 获取 / 更新 LLM 配置（base_url / api_key / model，任意 OpenAI 兼容接口） |
 
 
 ## 升级改造（阶段0 P0 修复完成）
@@ -58,7 +58,6 @@ uvicorn app.main:app --reload
 - **LLM 布尔容错**：严格 `isinstance(x, bool)` 校验，`"false"` 字符串不再误判
 
 ### 启动
-
 ```
 export AUTH_TOKEN=你的访问令牌
 pip install -r requirements.txt && uvicorn app.main:app --host 127.0.0.1 --port 8000
@@ -109,28 +108,23 @@ pip install -r requirements.txt && uvicorn app.main:app --host 127.0.0.1 --port 
 ## V2 版本（阶段 3.2~3.5：全 Agent 智能审计 + 可用性完善）
 
 ### 阶段 3.2 Agent 全量审计（根治静态漏报）
-
 - 新增 `agent_full_audit` 流水线阶段：Agent 不依赖 semgrep 命中行，自主遍历全部源码发现静态规则难以覆盖的漏洞（未授权访问 / 越权 / 逻辑 / 链式漏洞），rule_id 前缀 `agent-discovered-`
 - 多轮迭代审计（默认 3 轮，`FULL_AUDIT_ROUNDS` 可调），允许第一轮漏报、后续轮次补全
 - 与静态命中按 文件+行号 去重，避免重复消耗 token
 
 ### 阶段 3.3 沙箱保留 + 手工验证 + 任务管理
-
 - Web 任务完成后沙箱容器**保留**（`sandbox_cid`/`sandbox_port` 落库），任务详情页可"手动验证"：编辑 payload 一键在沙箱内发请求查看回显；"下载 POC 脚本"导出独立可运行的 Python 脚本
 - **停止**任务立即销毁沙箱并终止 Agent；**删除**任务彻底清理漏洞记录/上传/工作区/报告；运行中任务需先停止再删除
 - 任务列表按"进行中 / 已完成"分区展示；漏洞类型显示人类易读中文名（SQL 注入 / 远程命令执行 / 未授权访问…），内部规则 ID 悬浮展示
 
 ### 阶段 3.4 POC payload 格式规范化 + UI 优化
-
 - POC payload 统一为干净请求包格式：`POST /route?action=xxx` + `注入参数=k`（action 进 query、注入参数进 body），去除用户困惑的 `body:` 前缀；解析器兼容新旧两种形态
 - 生成的 Python POC 脚本同步新格式（URL 含 action、data 含注入参数）
 - 页面优化：文件选择按钮修复（原生 input 隐藏，仅一个按钮）、主容器加宽、非全居中布局
 
 ### 阶段 3.5 落库统一清洗
-
 - 所有 payload 落库前经 `normalize_payload()` 统一规范化，彻底清除 Agent 自由提交的 `body:` 残留
 - 清洗 semgrep 官方规则包注入的 "requires login" 页脚（`_clean_text`），报告不再出现该字符串
 
 ### 推理模型兼容
-
 - deepseek-reasoner / o3 等推理模型不支持 `temperature` 参数，`_chat` 自动省略，可在配置页直接切换
