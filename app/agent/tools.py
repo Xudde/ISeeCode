@@ -158,6 +158,16 @@ class SymbolIndex:
                     called.add(name)
         self.calls[rel] = called
 
+    # 语言关键字/控制流/常见内置符号：不算函数调用（否则 call_chain 全是噪音）
+    _NOISE_WORDS = {
+        "if", "else", "elif", "for", "foreach", "while", "do", "switch", "case", "catch", "finally",
+        "return", "throw", "new", "typeof", "sizeof", "await", "yield", "in", "of", "and", "or", "not",
+        "print", "echo", "die", "exit", "isset", "unset", "empty", "include", "require", "require_once",
+        "include_once", "list", "array", "true", "false", "null", "none", "self", "this", "static",
+        "synchronized", "try", "with", "as", "is", "lambda", "function", "func", "def", "end", "then",
+        "elif", "unless", "raise", "assert", "del", "global", "nonlocal", "pass", "break", "continue",
+    }
+
     def _index_regex(self, fp: Path) -> None:
         try:
             lines = fp.read_text(errors="ignore").splitlines()
@@ -170,7 +180,9 @@ class SymbolIndex:
             if m:
                 self._add_def(m.group(1), fp, i)
             for m in re.finditer(r"(\w+)\s*\(", line):
-                called.add(m.group(1))
+                w = m.group(1).lower()
+                if w not in self._NOISE_WORDS:
+                    called.add(m.group(1))
         self.calls[rel] = called
 
     def call_chain(self, symbol: str) -> str:
@@ -238,19 +250,40 @@ def run_semgrep_subset(workspace: str, rel_path: str) -> str:
         return f"ERROR: {e}"
 
 
-# 动态验证工具由 orchestrator 注入 SandboxHandle 后生成闭包（全局沙箱并发闸 ≤2）
+# 动态验证工具由 orchestrator 注入 SandboxHandle 后生成闭包。
+# 全局沙箱并发闸：唯一定义处（orchestrator 不得再建第二个，否则上限翻倍），
+# 上限取 config.SANDBOX_CONCURRENCY。
 import threading
-_sandbox_sem = threading.Semaphore(2)
+from app.config import SANDBOX_CONCURRENCY
+
+_sandbox_sem = threading.Semaphore(max(1, SANDBOX_CONCURRENCY))
 
 
 def make_http_request_tool(handle):
-    def http_request(method: str, path: str, params: str = "", body: str = "", headers: str = "") -> str:
-        """对沙箱内应用发 HTTP 请求。path 形如 /vuln?s=xxx；params 追加 query"""
-        url = path + (("&" + params) if params and "?" in path else (("?" + params) if params else ""))
+    def http_request(method: str = "GET", path: str = "/", params: str = "", body: str = "", headers: str = "") -> str:
+        """对沙箱内应用发 HTTP 请求。
+        path 形如 /vuln 或 /vuln?s=xxx；params 为查询串 k=v&k2=v2（会正确 URL 编码）；
+        body 为表单串（POST 时作为表单数据发送）；method 支持 GET/POST。"""
+        import urllib.parse
+
+        def _parse_qs(s: str) -> dict:
+            out = {}
+            for kv in (s or "").split("&"):
+                if "=" in kv:
+                    k, _, v = kv.partition("=")
+                    out[urllib.parse.unquote_plus(k.strip())] = urllib.parse.unquote_plus(v)
+            return out
+
+        url = path or "/"
+        q = _parse_qs(params)
+        if q:
+            url += ("&" if "?" in url else "?") + urllib.parse.urlencode(q)
         if not url.startswith("/"):
             url = "/" + url
+        data = _parse_qs(body) if body else None
+        m = (method or "GET").upper()
         with _sandbox_sem:
-            status, resp = handle.request(url, {}, timeout=10)
+            status, resp = handle.request(url, data or {}, timeout=10, method=m)
         return f"HTTP {status}\n{str(resp)[:1000]}"
     return http_request
 

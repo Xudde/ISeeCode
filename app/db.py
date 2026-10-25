@@ -45,11 +45,16 @@ def _migrate() -> None:
             ("agent_confidence", "VARCHAR(8)"),
             ("agent_reason", "TEXT"),
             ("analyzed_at", "DATETIME"),
+            ("title", "VARCHAR(128)"),
+            ("precondition", "VARCHAR(512)"),
         ],
         "tasks": [
             ("file_hash", "VARCHAR(64) DEFAULT ''"),
             ("upload_path", "VARCHAR(512) DEFAULT ''"),
             ("cancel_requested", "BOOLEAN DEFAULT 0"),
+            ("fingerprint", "TEXT DEFAULT ''"),
+            ("audit_mode", "VARCHAR(16) DEFAULT 'full'"),
+            ("tokens_used", "INTEGER DEFAULT 0"),
         ],
     }
     with engine.connect() as conn:

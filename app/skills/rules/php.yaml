@@ -1,0 +1,108 @@
+# PHP 漏洞规则：taint 规则 + 敏感函数 pattern 兜底
+# 说明：semgrep OSS 对 PHP 的 taint 不支持跨函数传播（source 在调用点、sink 在函数体内时漏报），
+# 故增加 pattern 类"敏感函数调用"规则兜底命中，再由 Agent 深度研判确认数据流真假。
+rules:
+  - id: php-sql-injection
+    mode: taint
+    languages: [php]
+    severity: ERROR
+    message: SQL 注入：用户输入直接拼接进 SQL 查询
+    pattern-sources:
+      - pattern: $_GET[...]
+      - pattern: $_POST[...]
+      - pattern: $_REQUEST[...]
+    pattern-sinks:
+      - pattern: mysqli_query($DB, $SQL)
+      - pattern: mysql_query($SQL)
+      - pattern: $DB->query($SQL)
+  - id: php-command-injection
+    mode: taint
+    languages: [php]
+    severity: ERROR
+    message: 命令注入：用户输入进入命令执行函数
+    pattern-sources:
+      - pattern: $_GET[...]
+      - pattern: $_POST[...]
+    pattern-sinks:
+      - pattern: system($CMD)
+      - pattern: exec($CMD)
+      - pattern: shell_exec($CMD)
+      - pattern: passthru($CMD)
+      - pattern: proc_open($CMD, ...)
+      - pattern: popen($CMD, ...)
+  - id: php-code-injection
+    languages: [php]
+    severity: ERROR
+    message: 代码注入：eval 执行动态代码
+    patterns:
+      - pattern: eval($X)
+  - id: php-file-inclusion
+    mode: taint
+    languages: [php]
+    severity: ERROR
+    message: 文件包含：用户输入进入 include/require，可导致 LFI/RFI
+    pattern-sources:
+      - pattern: $_GET[...]
+      - pattern: $_REQUEST[...]
+    pattern-sinks:
+      - pattern: include $X
+      - pattern: require $X
+      - pattern: include_once($X)
+      - pattern: require_once($X)
+  - id: php-unsafe-deserialization
+    languages: [php]
+    severity: ERROR
+    message: 不安全反序列化：unserialize 处理不可信输入
+    patterns:
+      - pattern-either:
+          - pattern: unserialize($_GET[...])
+          - pattern: unserialize($_POST[...])
+          - pattern: unserialize($_REQUEST[...])
+  # ---- 敏感函数调用兜底（pattern 直接命中，数据流真假由 Agent 深度研判）----
+  - id: php-sql-query-sink
+    languages: [php]
+    severity: ERROR
+    message: SQL 查询敏感点：query/exec/mysqli_query 调用。若 SQL 由用户输入拼接则存在 SQL 注入（需确认数据流）
+    patterns:
+      - pattern-either:
+          - pattern: $X->query($SQL)
+          - pattern: $X->exec($SQL)
+          - pattern: mysqli_query($DB, $SQL)
+          - pattern: mysql_query($SQL)
+  - id: php-file-read-sink
+    languages: [php]
+    severity: WARNING
+    message: 文件读取敏感函数：readfile/file/fopen。若参数含用户可控路径则任意文件读取
+    patterns:
+      - pattern-either:
+          - pattern: readfile($X)
+          - pattern: file($X)
+          - pattern: fopen($X, ...)
+  - id: php-file-delete-sink
+    languages: [php]
+    severity: WARNING
+    message: 文件删除敏感函数：unlink/rmdir。若参数含用户可控路径则任意文件删除（注意单次 ../ 过滤可用 ....// 绕过）
+    patterns:
+      - pattern-either:
+          - pattern: unlink($X)
+          - pattern: rmdir($X)
+  - id: php-ssrf-sink
+    languages: [php]
+    severity: WARNING
+    message: 远程请求函数：file_get_contents/curl_exec 处理外部输入，可能导致任意文件读取或 SSRF（若响应再进入命令执行则升级 RCE）
+    patterns:
+      - pattern-either:
+          - pattern: file_get_contents($X)
+          - pattern: curl_exec($X)
+  - id: php-command-sink
+    languages: [php]
+    severity: WARNING
+    message: 命令执行敏感函数：shell_exec/exec/system/passthru/proc_open/popen。若参数经远程内容或用户输入到达则命令注入
+    patterns:
+      - pattern-either:
+          - pattern: shell_exec($X)
+          - pattern: exec($X)
+          - pattern: system($X)
+          - pattern: passthru($X)
+          - pattern: proc_open($X, ...)
+          - pattern: popen($X, ...)

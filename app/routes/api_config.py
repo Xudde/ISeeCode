@@ -1,7 +1,8 @@
-"""LLM 配置 API（阶段0）"""
+"""LLM 配置 API（阶段0）+ Agent 引擎设置（运行时动态可调）"""
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
+from app.agent_settings import AGENT_SETTING_DEFAULTS, SETTING_LABELS, agent_settings
 from app.db import SessionLocal
 from app.models import Config
 from app.schemas import ConfigOut, ConfigUpdate
@@ -33,10 +34,12 @@ def _get_value(db: Session, key: str) -> str:
 
 @router.get("", response_model=ConfigOut)
 def get_config(db: Session = Depends(get_db)):
+    st = agent_settings(db)
     return ConfigOut(
         base_url=_get_value(db, "base_url"),
         api_key=mask_api_key(_get_value(db, "api_key")),
         model=_get_value(db, "model"),
+        **{k: str(st[k]) for k in AGENT_SETTING_DEFAULTS},
     )
 
 
@@ -54,5 +57,17 @@ def update_config(data: ConfigUpdate, db: Session = Depends(get_db)):
             db.add(Config(key=k, value=v))
         else:
             row.value = v
+    # Agent 引擎设置：显式传入（非 None）才保存
+    for k in AGENT_SETTING_DEFAULTS:
+        v = getattr(data, k, None)
+        if v is None:
+            continue
+        if not isinstance(v, int) or v < 1:
+            continue  # 非法值（非正整数）忽略
+        row = db.get(Config, k)
+        if row is None:
+            db.add(Config(key=k, value=str(v)))
+        else:
+            row.value = str(v)
     db.commit()
     return {"ok": True}

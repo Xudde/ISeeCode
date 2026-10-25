@@ -28,8 +28,8 @@ app = FastAPI(title="源码自动化审计平台", lifespan=lifespan)
 
 # 全局鉴权中间件（PUBLIC_PATHS 除外）
 app.middleware("http")(auth_middleware)
-# 极简登录页（未启用鉴权时仅提示）
-app.get("/login")(login_page)
+# 登录页：GET 渲染账号密码表单（?token= 兼容令牌直登），POST 校验登录
+app.api_route("/login", methods=["GET", "POST"])(login_page)
 
 app.include_router(pages.router)
 app.include_router(api_config.router)

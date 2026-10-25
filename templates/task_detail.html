@@ -1,0 +1,321 @@
+{% extends "base.html" %}
+{% set nav = 'tasks' %}
+{% block title %}任务 #{{ task.id if task else '?' }} · 源码自动化审计平台{% endblock %}
+{% block content %}
+{% if task %}
+
+<div class="page-head">
+  <div>
+    <div class="page-title">
+      <span class="tid" style="font-size:16px">#{{ task.id }}</span>
+      <span>{{ task.filename }}</span>
+      <span id="hd-status"></span>
+    </div>
+    <div class="page-sub" id="hd-meta"></div>
+    <div id="hd-err" class="error" style="margin-top:6px;font-size:12.5px" hidden></div>
+  </div>
+  <div class="head-actions" id="hd-actions"></div>
+</div>
+
+<div id="fp-card" class="card" hidden>
+  <div class="card-title">组件指纹 <span class="hint">识别到的框架 / 组件与语言分布</span></div>
+  <div class="fp-box" id="fp-box"></div>
+</div>
+
+<div class="stats" id="stats"></div>
+
+<!-- ==================== 执行日志 ==================== -->
+<div class="card log-card">
+  <div class="log-bar">
+    <div class="dots"><i></i><i></i><i></i></div>
+    <span class="log-title">pipeline.log</span>
+    <div class="log-ctrl">
+      <label><input type="checkbox" id="log-follow" checked> 自动滚动</label>
+      <button class="btn btn-sm" id="log-copy">复制</button>
+    </div>
+  </div>
+  <pre class="log" id="log">{{ task.log or '（暂无日志，任务排队中…）' }}</pre>
+</div>
+
+<!-- ==================== 漏洞列表 ==================== -->
+<div class="section-title">漏洞列表 <span class="cnt" id="vuln-cnt">…</span></div>
+<div class="filters">
+  <button class="fchip active" data-f="all">全部 <span class="n" id="n-all"></span></button>
+  <button class="fchip" data-f="real">已确认 <span class="n" id="n-real"></span></button>
+  <button class="fchip" data-f="fp">误报 <span class="n" id="n-fp"></span></button>
+  <button class="fchip" data-f="pending">未研判 <span class="n" id="n-pending"></span></button>
+  <div class="fsep"></div>
+  <select class="mini" id="f-sev">
+    <option value="">全部等级</option>
+    <option value="ERROR">ERROR</option><option value="HIGH">HIGH</option>
+    <option value="WARNING">WARNING</option><option value="MEDIUM">MEDIUM</option>
+    <option value="INFO">INFO</option><option value="LOW">LOW</option>
+  </select>
+  <div class="search-box">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+    <input type="text" id="f-search" placeholder="搜索文件 / 规则 / 理由…">
+  </div>
+</div>
+<div class="tbl-wrap">
+  <table class="tbl">
+    <thead><tr>
+      <th style="width:86px">等级</th><th style="width:170px">漏洞类型</th><th>位置</th>
+      <th style="width:110px">Agent 研判</th><th style="width:90px">POC</th><th>研判理由</th>
+    </tr></thead>
+    <tbody id="vuln-body">
+      <tr><td colspan="6"><div class="empty">加载中…</div></td></tr>
+    </tbody>
+  </table>
+</div>
+
+<script>window.__LABELS__ = {{ vuln_labels | tojson }};</script>
+{% else %}
+<div class="empty">任务不存在，可能已被删除。<a href="/">返回任务列表</a></div>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+{% if task %}
+<script>
+const TASK_ID = {{ task.id }};
+const FINAL = SAP.FINAL;
+let task = null, vulns = [];
+let filter = 'all', sevFilter = '', search = '';
+const expanded = new Set();
+let vulnSig = '';
+
+/* ---------- 头部渲染 ---------- */
+function renderHead() {
+  document.getElementById('hd-status').innerHTML = SAP.statusPill(task.status);
+  const mode = task.audit_mode === 'static' ? '仅静态扫描' : '完整审计';
+  document.getElementById('hd-meta').innerHTML =
+    `<div class="kv">
+      <span>技术栈 ${SAP.stackTags(task.tech_stack)}</span>
+      <span>模式 <b>${mode}</b></span>
+      <span>类型 <b>${SAP.esc(task.project_type || '-')}</b></span>
+      <span>已用 token <b style="font-family:var(--mono)">${SAP.fmtNum(task.tokens_used)}</b></span>
+      <span>创建于 <b>${SAP.fmtTime(task.created_at)}</b></span>
+    </div>`;
+  const errBox = document.getElementById('hd-err');
+  if (task.error_msg && FINAL.includes(task.status)) {
+    errBox.hidden = false; errBox.textContent = '错误信息：' + task.error_msg;
+  } else errBox.hidden = true;
+
+  let h = '';
+  if (!FINAL.includes(task.status))
+    h += `<button class="btn btn-danger" id="btn-stop">停止任务</button>`;
+  if (['cancelled', 'failed', 'skipped'].includes(task.status))
+    h += `<button class="btn btn-green" id="btn-resume">继续任务</button>`;
+  if (task.report_path) {
+    h += `<a class="btn btn-primary" href="/api/tasks/${TASK_ID}/report" target="_blank">下载 HTML 报告</a>`;
+    h += `<a class="btn" href="/api/tasks/${TASK_ID}/report?format=md">Markdown</a>`;
+    h += `<a class="btn" href="/api/tasks/${TASK_ID}/report?format=json">JSON（AI 版）</a>`;
+  }
+  h += `<button class="btn btn-danger" id="btn-del">删除任务</button>`;
+  document.getElementById('hd-actions').innerHTML = h;
+}
+
+function renderFingerprint() {
+  const card = document.getElementById('fp-card');
+  if (!task.fingerprint) { card.hidden = true; return; }
+  let fp; try { fp = JSON.parse(task.fingerprint); } catch (e) { card.hidden = true; return; }
+  const comps = (fp.components || []).map(c => `<span class="fp-comp">${SAP.esc(c)}</span>`).join('') || '<span class="muted">未识别到知名组件</span>';
+  const langs = Object.entries(fp.lang_stats || {}).sort((a, b) => b[1] - a[1]).slice(0, 6)
+    .map(([k, v]) => `${SAP.esc(k)} ${v}`).join(' · ') || '-';
+  card.hidden = false;
+  document.getElementById('fp-box').innerHTML = comps +
+    `<div class="fp-meta">语言分布：${langs}${fp.total_files ? ` · 共 ${fp.total_files} 文件` : ''}</div>`;
+}
+
+/* ---------- 统计 ---------- */
+function renderStats() {
+  const n = vulns.length;
+  const c = { real: 0, fp: 0, pending: 0, poc: 0, err: 0 };
+  vulns.forEach(v => { const x = SAP.verdict(v); c[x.key]++; if (v.poc_verified === true) c.poc++; });
+  document.getElementById('stats').innerHTML = `
+    <div class="stat s-info"><div class="num">${n}</div><div class="lbl">静态扫描检出</div></div>
+    <div class="stat s-bad"><div class="num">${c.real}</div><div class="lbl">Agent 确认 / 疑似真实</div></div>
+    <div class="stat s-dim"><div class="num">${c.fp}</div><div class="lbl">判定误报</div></div>
+    <div class="stat s-warn"><div class="num">${c.pending}</div><div class="lbl">未研判 / 未验证</div></div>
+    <div class="stat s-ok"><div class="num">${c.poc}</div><div class="lbl">POC 动态复现</div></div>`;
+  document.getElementById('n-all').textContent = n;
+  document.getElementById('n-real').textContent = c.real;
+  document.getElementById('n-fp').textContent = c.fp;
+  document.getElementById('n-pending').textContent = c.pending;
+  document.getElementById('vuln-cnt').textContent = n;
+}
+
+/* ---------- 日志 ---------- */
+function renderLog() {
+  const pre = document.getElementById('log');
+  const text = task.log || '（暂无日志）';
+  if (pre.textContent !== text) {
+    pre.innerHTML = SAP.esc(text).split('\n').map(l => {
+      let cls = '';
+      if (/失败|异常|错误|error|Traceback/i.test(l)) cls = 'err';
+      else if (/\b完成|成功|已生成\b/.test(l)) cls = 'okk';
+      const m = l.match(/^(\[\d{2}:\d{2}:\d{2}\])/);
+      if (m) l = `<span class="t">${m[1]}</span>` + l.slice(m[1].length);
+      return cls ? `<span class="${cls}">${l}</span>` : l;
+    }).join('\n');
+    if (document.getElementById('log-follow').checked) pre.scrollTop = pre.scrollHeight;
+  }
+}
+document.getElementById('log-copy').addEventListener('click', () => {
+  navigator.clipboard.writeText(task.log || '').then(() => SAP.toast('日志已复制', 'ok'));
+});
+
+/* ---------- 漏洞表 ---------- */
+function codeBlock(v) {
+  if (!v.code_snippet) return '';
+  const anchor = parseInt(v.line, 10) || 0;
+  const lines = v.code_snippet.split('\n');
+  const start = Math.max(1, anchor - Math.floor(lines.length / 2));
+  const body = lines.map((l, i) => {
+    const no = start + i;
+    return (no === anchor ? `<span class="hl">` : `<span>`) +
+      String(no).padStart(5, ' ') + ' │ ' + SAP.esc(l) + '</span>';
+  }).join('\n');
+  return `<pre class="code">${body}</pre>`;
+}
+
+function pocBlock(v) {
+  if (!v.poc_payload) return '';
+  let h = `<h4>POC Payload</h4><div class="poc-line">${SAP.esc(v.poc_payload)}</div>`;
+  if (task.status === 'completed') {
+    h += `<div class="poc-box">
+      <textarea rows="2" id="pta-${v.id}">${SAP.esc(v.poc_payload)}</textarea>
+      <div style="display:flex;gap:8px;align-items:center">
+        <button class="btn btn-sm btn-primary poc-run" data-vuln="${v.id}">在沙箱内执行</button>
+        <a class="btn btn-sm" href="/api/tasks/${TASK_ID}/poc-script/${v.id}">下载 POC 脚本</a>
+        <span class="muted" style="font-size:11.5px">在保留的禁网沙箱容器内重放，返回状态码与回显</span>
+      </div>
+      <pre class="code poc-result" id="pocr-${v.id}" hidden></pre>
+    </div>`;
+  }
+  return h;
+}
+
+function renderVulns(force) {
+  const sig = JSON.stringify(vulns.map(v => [v.id, v.agent_status, v.poc_verified, v.severity]));
+  if (!force && sig === vulnSig) return;
+  vulnSig = sig;
+  renderStats();
+
+  const kw = search.trim().toLowerCase();
+  const list = vulns.filter(v => {
+    if (filter !== 'all' && SAP.verdict(v).key !== filter) return false;
+    if (sevFilter && (v.severity || '').toUpperCase() !== sevFilter) return false;
+    if (kw) {
+      const hay = `${v.file_path} ${v.rule_id} ${v.agent_reason || ''} ${v.llm_reason || ''}`.toLowerCase();
+      if (!hay.includes(kw)) return false;
+    }
+    return true;
+  });
+
+  const body = document.getElementById('vuln-body');
+  if (!list.length) {
+    body.innerHTML = `<tr><td colspan="6"><div class="empty">${vulns.length ? '没有符合筛选条件的漏洞' : '暂无漏洞数据'}</div></td></tr>`;
+    return;
+  }
+  body.innerHTML = list.map(v => {
+    const vd = SAP.verdict(v);
+    const label = v.title || (window.__LABELS__ && window.__LABELS__[v.id]) || v.rule_id.split('.').pop();
+    const open = expanded.has(v.id);
+    const conf = v.agent_confidence ? ` <span class="muted" style="font-size:11px">置信 ${SAP.esc(v.agent_confidence)}</span>` : '';
+    return `
+    <tr class="vuln-row" data-id="${v.id}">
+      <td>${SAP.sevBadge(v.severity)}</td>
+      <td><span class="rule" title="${SAP.esc(v.rule_id)}">${SAP.esc(label)}</span>${v.source === 'agent-full' ? ' <span class="stack-tag">全量审计</span>' : ''}</td>
+      <td><div class="vloc" title="${SAP.esc(v.file_path)}:${v.line}"><b>${SAP.esc(v.file_path.split('/').pop())}</b>:${v.line}<span class="muted">　${SAP.esc(v.file_path)}</span></div></td>
+      <td><span class="vbadge ${vd.cls}">${vd.txt}</span>${conf}</td>
+      <td>${v.poc_verified === true ? '<span class="vbadge vb-real">已复现</span>' : v.poc_verified === false ? '<span class="vbadge vb-fp">未复现</span>' : '<span class="muted">—</span>'}</td>
+      <td><div class="vreason" title="${SAP.esc(v.agent_reason || v.llm_reason || '')}">${SAP.esc(v.agent_reason || v.llm_reason || '（无研判理由）')}</div></td>
+    </tr>
+    ${open ? `<tr class="vdetail-row" data-id="${v.id}"><td colspan="6"><div class="vdetail-in">
+        <h4>研判理由</h4><div class="ev-text">${SAP.esc(v.agent_reason || v.llm_reason || '（无）')}</div>
+        ${v.precondition ? `<h4>复现条件</h4><div class="poc-line">${SAP.esc(v.precondition)}</div>` : ''}
+        ${v.agent_evidence ? `<h4>证据链</h4><div class="ev-text">${SAP.esc(v.agent_evidence)}</div>` : ''}
+        ${v.code_snippet ? `<h4>代码片段（第 ${v.line} 行高亮${v.source === 'agent-full' ? '，全量审计发现，行号供参考' : ''}）</h4>${codeBlock(v)}` : ''}
+        ${pocBlock(v)}
+        ${v.verify_result ? `<h4>验证结果</h4><div class="ev-text">${SAP.esc(v.verify_result)}</div>` : ''}
+      </div></td></tr>` : ''}`;
+  }).join('');
+}
+
+/* ---------- 筛选交互 ---------- */
+document.querySelectorAll('.fchip').forEach(b => b.addEventListener('click', () => {
+  document.querySelectorAll('.fchip').forEach(x => x.classList.remove('active'));
+  b.classList.add('active');
+  filter = b.dataset.f;
+  renderVulns(true);
+}));
+document.getElementById('f-sev').addEventListener('change', e => { sevFilter = e.target.value; renderVulns(true); });
+document.getElementById('f-search').addEventListener('input', e => { search = e.target.value; renderVulns(true); });
+
+/* 行展开 / 收起（委托） */
+document.getElementById('vuln-body').addEventListener('click', e => {
+  if (e.target.closest('.poc-run') || e.target.closest('a') || e.target.closest('textarea')) return;
+  const row = e.target.closest('.vuln-row');
+  if (!row) return;
+  const id = Number(row.dataset.id);
+  expanded.has(id) ? expanded.delete(id) : expanded.add(id);
+  renderVulns(true);
+});
+
+/* 手工 POC 执行（委托） */
+document.getElementById('vuln-body').addEventListener('click', async e => {
+  const btn = e.target.closest('.poc-run');
+  if (!btn) return;
+  e.preventDefault();
+  const id = btn.dataset.vuln;
+  const payload = (document.getElementById('pta-' + id) || {}).value || '';
+  const pre = document.getElementById('pocr-' + id);
+  pre.hidden = false; pre.textContent = '执行中…';
+  try {
+    const data = await SAP.api(`/api/tasks/${TASK_ID}/poc-test`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ vuln_id: Number(id), payload: payload.trim() })
+    });
+    pre.textContent = `HTTP ${data.status}\n${'─'.repeat(56)}\n${data.response}`;
+  } catch (err) { pre.textContent = '错误: ' + err.message; }
+});
+
+/* ---------- 头部按钮（委托） ---------- */
+document.getElementById('hd-actions').addEventListener('click', async e => {
+  const stop = e.target.closest('#btn-stop');
+  const resume = e.target.closest('#btn-resume');
+  const del = e.target.closest('#btn-del');
+  try {
+    if (stop) {
+      if (!confirm(`确定停止任务 #${TASK_ID}？\n已发现的结果会保留并生成阶段性报告，之后可「继续」续跑。`)) return;
+      await SAP.api(`/api/tasks/${TASK_ID}/stop`, { method: 'POST' });
+      SAP.toast('已请求停止，结果将保留为阶段性报告', 'ok'); refresh();
+    } else if (resume) {
+      if (!confirm(`继续任务 #${TASK_ID}？已研判部分不会重复消耗 token。`)) return;
+      await SAP.api(`/api/tasks/${TASK_ID}/resume`, { method: 'POST' });
+      SAP.toast('任务已续跑', 'ok'); refresh();
+    } else if (del) {
+      if (!confirm(`确定删除任务 #${TASK_ID}？漏洞记录、工作区与报告将一并删除，不可恢复。`)) return;
+      await SAP.api(`/api/tasks/${TASK_ID}`, { method: 'DELETE' });
+      location.href = '/';
+    }
+  } catch (err) { SAP.toast('操作失败：' + err.message, 'err'); }
+});
+
+/* ---------- 轮询 ---------- */
+let timer = null;
+async function refresh() {
+  try {
+    task = await SAP.api(`/api/tasks/${TASK_ID}`);
+    renderHead(); renderFingerprint(); renderLog();
+    vulns = await SAP.api(`/api/tasks/${TASK_ID}/vulns`);
+    renderVulns();
+    if (FINAL.includes(task.status) && timer) { clearInterval(timer); timer = null; }
+  } catch (e) { /* 保留上次数据 */ }
+}
+refresh();
+if (!FINAL.includes('{{ task.status }}')) timer = setInterval(refresh, 3000);
+</script>
+{% endif %}
+{% endblock %}

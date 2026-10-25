@@ -1,11 +1,12 @@
 """任务管理 API：上传（含去重）+ 列表 + 详情 + 漏洞 + 停止 + 删除 + 报告下载 + 手工 POC"""
 import hashlib
+import os
 import shutil
 import threading
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import APIRouter, Body, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 from sqlalchemy.orm import Session
 
@@ -14,7 +15,7 @@ from app.config import ALLOWED_EXTENSIONS, DECOMPILE_EXTENSIONS, MAX_UPLOAD_SIZE
 from app.models import Task, Vulnerability
 from app.queue_worker import enqueue
 from app.routes.api_config import get_db
-from app.schemas import TaskOut, VulnerabilityOut
+from app.schemas import TaskDetailOut, TaskOut, VulnerabilityOut
 from app.skills import poc, sandbox
 
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
@@ -30,8 +31,14 @@ DEDUP_BLOCK_STATUSES = ACTIVE_STATUSES + ("completed",)
 
 
 @router.post("/upload", response_model=TaskOut)
-async def upload_zip(file: UploadFile = File(...), db: Session = Depends(get_db)):
-    """上传源码包，创建任务并入队；同内容文件自动去重，避免重复审计浪费 token"""
+async def upload_zip(file: UploadFile = File(...),
+                     audit_mode: str = Form("full"),
+                     db: Session = Depends(get_db)):
+    """上传源码包，创建任务并入队；同内容文件自动去重，避免重复审计浪费 token
+    audit_mode: full=完整审计（Agent 深度研判+全量审计，消耗 token）；
+                static=仅静态扫描（semgrep 免费结果，不消耗 token）"""
+    if audit_mode not in ("full", "static"):
+        audit_mode = "full"
     ext = Path(file.filename).suffix.lower()
     is_dockerfile = "dockerfile" in file.filename.lower() or ext == ".dockerfile"
     if ext == ".apk":
@@ -45,43 +52,53 @@ async def upload_zip(file: UploadFile = File(...), db: Session = Depends(get_db)
     else:
         raise HTTPException(status_code=400, detail="支持 .zip 源码包 / .apk 应用 / .tar 镜像包 / Dockerfile / 反编译文件（.jar .war .class .dex .dll .exe .pyc .so .elf）")
 
-    # 流式接收：避免大文件一次性读入内存导致超时/断连，需重传
-    chunks = []
+    # 流式落盘：边收边写临时文件并增量计算哈希（旧实现整包读进内存，
+    # 200MB×并发上传会吃掉数百 MB 内存）
+    hasher = hashlib.sha256()
     total = 0
-    while True:
-        chunk = await file.read(1024 * 1024)  # 1MB 分块
-        if not chunk:
-            break
-        total += len(chunk)
-        if total > MAX_UPLOAD_SIZE:
-            raise HTTPException(status_code=413, detail="文件超过 200MB 上限")
-        chunks.append(chunk)
-    content = b"".join(chunks)
-    if len(content) == 0:
-        raise HTTPException(status_code=400, detail="文件为空")
+    tmp_path = UPLOAD_DIR / f".uploading_{datetime.now().strftime('%Y%m%d%H%M%S')}_{os.getpid()}"
+    try:
+        with tmp_path.open("wb") as out:
+            while True:
+                chunk = await file.read(1024 * 1024)  # 1MB 分块
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_UPLOAD_SIZE:
+                    raise HTTPException(status_code=413, detail="文件超过 200MB 上限")
+                hasher.update(chunk)
+                out.write(chunk)
+        if total == 0:
+            raise HTTPException(status_code=400, detail="文件为空")
+        file_hash = hasher.hexdigest()
 
-    file_hash = hashlib.sha256(content).hexdigest()
+        with _upload_lock:
+            # 同内容文件去重：已有任务正在审计或已完成，直接指向旧任务，不重复消耗 token
+            dup = db.query(Task).filter(Task.file_hash == file_hash).order_by(Task.id.asc()).first()
+            if dup and dup.status in DEDUP_BLOCK_STATUSES:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"相同文件已存在（任务 #{dup.id}，状态：{dup.status}），已避免重复审计浪费 token。请直接查看该任务结果。",
+                )
 
-    with _upload_lock:
-        # 同内容文件去重：已有任务正在审计或已完成，直接指向旧任务，不重复消耗 token
-        dup = db.query(Task).filter(Task.file_hash == file_hash).order_by(Task.id.asc()).first()
-        if dup and dup.status in DEDUP_BLOCK_STATUSES:
-            raise HTTPException(
-                status_code=409,
-                detail=f"相同文件已存在（任务 #{dup.id}，状态：{dup.status}），已避免重复审计浪费 token。请直接查看该任务结果。",
-            )
+            # 保存：临时文件原子改名
+            ts = datetime.now().strftime("%Y%m%d%H%M%S")
+            safe_name = f"{ts}_{Path(file.filename).name}"
+            save_path = UPLOAD_DIR / safe_name
+            tmp_path.replace(save_path)
 
-        # 保存
-        ts = datetime.now().strftime("%Y%m%d%H%M%S")
-        safe_name = f"{ts}_{Path(file.filename).name}"
-        save_path = UPLOAD_DIR / safe_name
-        save_path.write_bytes(content)
-
-        task = Task(filename=file.filename, file_hash=file_hash,
-                    upload_path=str(save_path), workspace_path=str(save_path), project_type=ptype)
-        db.add(task)
-        db.commit()
-        db.refresh(task)
+            task = Task(filename=file.filename, file_hash=file_hash,
+                        upload_path=str(save_path), workspace_path=str(save_path),
+                        project_type=ptype, audit_mode=audit_mode)
+            db.add(task)
+            db.commit()
+            db.refresh(task)
+    except HTTPException:
+        tmp_path.unlink(missing_ok=True)  # 失败清理半成品临时文件
+        raise
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
     enqueue(task.id)
     return task
@@ -92,7 +109,7 @@ def list_tasks(db: Session = Depends(get_db)):
     return db.query(Task).order_by(Task.id.desc()).all()
 
 
-@router.get("/{task_id}", response_model=TaskOut)
+@router.get("/{task_id}", response_model=TaskDetailOut)
 def get_task(task_id: int, db: Session = Depends(get_db)):
     task = db.get(Task, task_id)
     if task is None:
@@ -107,7 +124,7 @@ def get_task_vulns(task_id: int, db: Session = Depends(get_db)):
 
 @router.post("/{task_id}/stop")
 def stop_task(task_id: int, db: Session = Depends(get_db)):
-    """请求停止任务：协作式取消，worker 在阶段间检查并清理沙箱"""
+    """请求停止任务：协作式取消，worker 在阶段间检查并清理沙箱，且保留已发现结果生成阶段性报告"""
     task = db.get(Task, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="任务不存在")
@@ -116,18 +133,40 @@ def stop_task(task_id: int, db: Session = Depends(get_db)):
     task.cancel_requested = True
     if task.status == "pending":
         task.status = "cancelled"  # 还在队列里，直接标记取消
+        task.error_msg = "任务已被停止（已发现结果已保存，可点击“继续任务”续跑）"
     db.commit()
+    return {"ok": True, "id": task.id, "status": task.status, "hint": "已发现结果将保留并生成阶段性报告，可点击“继续任务”续跑"}
+
+
+@router.post("/{task_id}/resume")
+def resume_task(task_id: int, db: Session = Depends(get_db)):
+    """继续任务：停止/失败/跳过的任务从已有进度续跑。
+    已研判的漏洞（agent_status 非空）不会重复分析，不重复消耗 token。"""
+    task = db.get(Task, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    if task.status not in ("cancelled", "failed", "skipped"):
+        raise HTTPException(status_code=400, detail=f"仅已停止/失败/跳过的任务可继续（当前 {task.status}）")
+    if task.cancel_requested:
+        task.cancel_requested = False
+    task.status = "pending"
+    task.error_msg = None
+    task.log = (task.log or "") + f"\n[{datetime.now().strftime('%H:%M:%S')}] 任务继续：从已有进度恢复，已研判结果不重复消耗 token"
+    db.commit()
+    enqueue(task.id)
     return {"ok": True, "id": task.id, "status": task.status}
 
 
 @router.delete("/{task_id}")
 def delete_task(task_id: int, db: Session = Depends(get_db)):
-    """删除任务：清理数据库记录与上传/工作区/报告文件；运行中的任务需先停止"""
+    """删除任务：清理数据库记录与上传/工作区/报告文件；仅允许删除终态任务。
+    （此前"cancel_requested 即可删"会与仍在运行的 worker 竞态：删除 rmtree 工作区导致
+    运行中任务异常，且 SQLite 复用 rowid 造成新旧任务同 id 双跑——task 25 事故根因）"""
     task = db.get(Task, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="任务不存在")
-    if task.status in ACTIVE_STATUSES and not task.cancel_requested:
-        raise HTTPException(status_code=409, detail="任务正在运行，请先停止后再删除")
+    if task.status not in ("completed", "failed", "skipped", "cancelled"):
+        raise HTTPException(status_code=409, detail="任务仍在运行/排队，请先停止并等待任务进入终态后再删除")
 
     db.query(Vulnerability).filter(Vulnerability.task_id == task_id).delete()
     # 销毁保留的沙箱容器（手工 POC 验证用），避免容器残留
@@ -160,7 +199,7 @@ def delete_task(task_id: int, db: Session = Depends(get_db)):
 
 @router.get("/{task_id}/report")
 def download_report(task_id: int, db: Session = Depends(get_db), format: str = "html"):
-    """下载报告：默认自包含 HTML，format=md 下载 Markdown 版本"""
+    """下载报告：默认自包含 HTML；format=md 人看 Markdown；format=json AI 版结构化 JSON"""
     task = db.get(Task, task_id)
     if task is None or not task.report_path or not Path(task.report_path).exists():
         raise HTTPException(status_code=404, detail="报告不存在")
@@ -169,6 +208,11 @@ def download_report(task_id: int, db: Session = Depends(get_db), format: str = "
         if not md_path.exists():
             raise HTTPException(status_code=404, detail="Markdown 报告不存在")
         return FileResponse(md_path, media_type="text/markdown", filename=f"task_{task_id}_report.md")
+    if format == "json":
+        json_path = Path(task.report_path).with_suffix(".json")
+        if not json_path.exists():
+            raise HTTPException(status_code=404, detail="JSON 报告不存在（旧版报告代码生成，可重新生成）")
+        return FileResponse(json_path, media_type="application/json", filename=f"task_{task_id}_report.json")
     return FileResponse(
         task.report_path,
         media_type="text/html",

@@ -1,0 +1,223 @@
+{% extends "base.html" %}
+{% set nav = 'tasks' %}
+{% block title %}任务列表 · 源码自动化审计平台{% endblock %}
+{% block content %}
+
+<div class="page-head">
+  <div>
+    <div class="page-title">审计任务</div>
+    <div class="page-sub">上传源码包，平台自动完成：静态扫描 → LLM 误报研判 → Docker 沙箱 POC 验证 → Agent 全量审计 → 生成报告</div>
+  </div>
+  <div class="head-actions" id="overview-chips"></div>
+</div>
+
+<!-- ==================== 上传 ==================== -->
+<div class="card">
+  <div class="card-title">新建审计任务</div>
+  <form id="upload-form">
+    <div class="dropzone" id="dropzone">
+      <svg class="dz-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+      <div class="dz-main" id="dz-main">拖拽文件到此处，或 <b>点击选择</b></div>
+      <div class="dz-sub" id="dz-sub">源码包 / 应用 / 镜像 / 编译产物，最大 200MB</div>
+      <input type="file" id="file-input" hidden
+             accept=".zip,.apk,.tar,.dockerfile,Dockerfile,.jar,.war,.class,.dex,.dll,.exe,.pyc,.so,.elf,.bin">
+    </div>
+    <div class="upload-meta">
+      <div class="seg">
+        <label><input type="radio" name="audit_mode" value="full" checked><span>完整审计（Agent 研判 + 全量审计）</span></label>
+        <label><input type="radio" name="audit_mode" value="static"><span>仅静态扫描（不耗 token）</span></label>
+      </div>
+      <button type="submit" class="btn btn-primary" id="btn-upload">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+        上传并开始审计
+      </button>
+      <div class="upload-msg" id="upload-msg" style="flex:1"></div>
+    </div>
+    <div class="progress" id="prog"><i id="prog-bar"></i></div>
+    <div class="support-types">
+      <span class="type-chip">.zip 源码包</span><span class="type-chip">.apk 应用分析</span><span class="type-chip">.tar 镜像 / Dockerfile 基线</span>
+      <span class="type-chip">.jar/.war/.class → Java</span><span class="type-chip">.dex → Android</span><span class="type-chip">.dll/.exe → C#</span>
+      <span class="type-chip">.pyc → Python</span><span class="type-chip">.so/.elf/.bin → 字符串特征</span>
+    </div>
+    <div class="tip-box"><b>省钱建议</b>：相同文件自动去重不重复消耗 token。先用「仅静态扫描」免费看 semgrep 命中与组件指纹，确认有值得深挖的疑点后再跑完整审计；中途中停止的任务可随时「继续」续跑，已研判部分不会重复计费。</div>
+  </form>
+</div>
+
+<!-- ==================== 进行中 ==================== -->
+<div class="section-title">进行中的任务 <span class="cnt" id="active-count">0</span></div>
+<div class="tbl-wrap">
+  <table class="tbl">
+    <thead><tr><th style="width:60px">ID</th><th>文件名</th><th style="width:130px">状态</th><th style="width:200px">技术栈</th><th style="width:170px">创建时间</th><th style="width:220px">操作</th></tr></thead>
+    <tbody id="active-body"></tbody>
+  </table>
+</div>
+
+<!-- ==================== 历史 ==================== -->
+<div class="section-title">历史任务 <span class="cnt" id="done-count">0</span></div>
+<div class="tbl-wrap">
+  <table class="tbl">
+    <thead><tr><th style="width:60px">ID</th><th>文件名</th><th style="width:130px">状态</th><th style="width:200px">技术栈</th><th style="width:170px">创建时间</th><th style="width:280px">操作</th></tr></thead>
+    <tbody id="done-body"></tbody>
+  </table>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+const FINAL = SAP.FINAL;
+let tasks = [];
+let uploading = false;
+
+function rowActions(t, isActive) {
+  let h = `<a class="btn btn-sm" href="/tasks/${t.id}">详情</a>`;
+  if (isActive) h += ` <button class="btn btn-sm btn-danger act-stop" data-id="${t.id}">停止</button>`;
+  if (['cancelled', 'failed', 'skipped'].includes(t.status)) h += ` <button class="btn btn-sm btn-green act-resume" data-id="${t.id}">继续</button>`;
+  if (t.report_path) h += ` <a class="btn btn-sm" href="/api/tasks/${t.id}/report" target="_blank">报告</a>`;
+  h += ` <button class="btn btn-sm btn-danger act-del" data-id="${t.id}" data-name="${SAP.esc(t.filename)}">删除</button>`;
+  return h;
+}
+
+function renderRow(t) {
+  const isActive = !FINAL.includes(t.status);
+  const mode = t.audit_mode === 'static'
+    ? '<span class="vbadge vb-fp" style="margin-left:6px">仅静态</span>' : '';
+  const err = (!isActive && t.error_msg)
+    ? `<div class="muted" style="font-size:11.5px;color:var(--red);max-width:380px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${SAP.esc(t.error_msg)}">${SAP.esc(t.error_msg)}</div>` : '';
+  return `<tr>
+    <td class="tid">#${t.id}</td>
+    <td><div class="fname" title="${SAP.esc(t.filename)}">${SAP.esc(t.filename)}</div>${err}</td>
+    <td>${SAP.statusPill(t.status)}${mode}</td>
+    <td>${SAP.stackTags(t.tech_stack)}</td>
+    <td class="muted" style="font-size:12px">${SAP.fmtTime(t.created_at)}</td>
+    <td><div class="ops">${rowActions(t, isActive)}</div></td>
+  </tr>`;
+}
+
+function render() {
+  const active = tasks.filter(t => !FINAL.includes(t.status));
+  const done = tasks.filter(t => FINAL.includes(t.status));
+  document.getElementById('active-count').textContent = active.length;
+  document.getElementById('done-count').textContent = done.length;
+  document.getElementById('active-body').innerHTML = active.map(renderRow).join('')
+    || `<tr><td colspan="6"><div class="empty">当前没有进行中的审计任务</div></td></tr>`;
+  document.getElementById('done-body').innerHTML = done.map(renderRow).join('')
+    || `<tr><td colspan="6"><div class="empty">暂无历史任务</div></td></tr>`;
+  const ok = done.filter(t => t.status === 'completed').length;
+  document.getElementById('overview-chips').innerHTML =
+    `<span class="fchip">全部 <span class="n">${tasks.length}</span></span>` +
+    `<span class="fchip">进行中 <span class="n">${active.length}</span></span>` +
+    `<span class="fchip">已完成 <span class="n">${ok}</span></span>`;
+}
+
+async function poll() {
+  if (uploading) return;
+  try {
+    tasks = await SAP.api('/api/tasks');
+    render();
+  } catch (e) { /* 服务暂不可达时保留上一次数据 */ }
+}
+
+/* ---------- 上传（XHR 进度条） ---------- */
+const dz = document.getElementById('dropzone');
+const fileInput = document.getElementById('file-input');
+const msg = document.getElementById('upload-msg');
+
+dz.addEventListener('click', () => fileInput.click());
+dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('drag'); });
+dz.addEventListener('dragleave', () => dz.classList.remove('drag'));
+dz.addEventListener('drop', e => {
+  e.preventDefault(); dz.classList.remove('drag');
+  if (e.dataTransfer.files.length) setFile(e.dataTransfer.files[0]);
+});
+fileInput.addEventListener('change', () => { if (fileInput.files.length) setFile(fileInput.files[0]); });
+
+function setFile(f) {
+  fileInput.files = new DataTransfer().files; // 清空原生选择，以 drop 的为准时同步
+  const dt = new DataTransfer(); dt.items.add(f); fileInput.files = dt.files;
+  dz.classList.add('has-file');
+  document.getElementById('dz-main').innerHTML = `<b>${SAP.esc(f.name)}</b>`;
+  document.getElementById('dz-sub').textContent = `${(f.size / 1048576).toFixed(2)} MB · 点击可重新选择`;
+  msg.textContent = ''; msg.className = 'upload-msg';
+}
+
+document.getElementById('upload-form').addEventListener('submit', e => {
+  e.preventDefault();
+  if (uploading) return;
+  if (!fileInput.files.length) { msg.className = 'upload-msg err'; msg.textContent = '请先选择或拖入文件'; return; }
+  const file = fileInput.files[0];
+  const mode = document.querySelector('input[name=audit_mode]:checked').value;
+  const fd = new FormData();
+  fd.append('file', file);
+  fd.append('audit_mode', mode);
+
+  uploading = true;
+  const btn = document.getElementById('btn-upload');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spin"></span> 上传中…';
+  document.getElementById('prog').classList.add('on');
+  msg.className = 'upload-msg'; msg.textContent = `上传中（${(file.size / 1048576).toFixed(1)}MB）…`;
+
+  const xhr = new XMLHttpRequest();
+  xhr.open('POST', '/api/tasks/upload');
+  xhr.upload.onprogress = ev => {
+    if (ev.lengthComputable) document.getElementById('prog-bar').style.width = Math.round(ev.loaded / ev.total * 100) + '%';
+  };
+  xhr.onload = () => {
+    let data = null; try { data = JSON.parse(xhr.responseText); } catch (_) {}
+    if (xhr.status >= 200 && xhr.status < 300) {
+      msg.className = 'upload-msg ok';
+      msg.textContent = `任务 #${data.id} 已创建，正在进入审计流水线…`;
+      SAP.toast(`任务 #${data.id} 创建成功`, 'ok');
+      fileInput.value = ''; dz.classList.remove('has-file');
+      document.getElementById('dz-main').innerHTML = '拖拽文件到此处，或 <b>点击选择</b>';
+      document.getElementById('dz-sub').textContent = '源码包 / 应用 / 镜像 / 编译产物，最大 200MB';
+      setTimeout(() => location.href = '/tasks/' + data.id, 900);
+    } else if (xhr.status === 409) {
+      msg.className = 'upload-msg err';
+      msg.textContent = data && data.detail ? data.detail : '重复文件';
+      const m = /任务 #(\d+)/.exec((data && data.detail) || '');
+      if (m) { msg.textContent += '，正在跳转…'; setTimeout(() => location.href = '/tasks/' + m[1], 1200); }
+    } else {
+      msg.className = 'upload-msg err';
+      msg.textContent = '上传失败：' + ((data && data.detail) || `HTTP ${xhr.status}`);
+    }
+  };
+  xhr.onerror = () => { msg.className = 'upload-msg err'; msg.textContent = '上传中断（网络问题），请重试'; };
+  xhr.onloadend = () => {
+    uploading = false; btn.disabled = false;
+    btn.innerHTML = '上传并开始审计';
+    setTimeout(() => { document.getElementById('prog').classList.remove('on'); document.getElementById('prog-bar').style.width = '0'; }, 800);
+  };
+  xhr.send(fd);
+});
+
+/* ---------- 行内操作（事件委托） ---------- */
+document.querySelector('.main').addEventListener('click', async e => {
+  const stop = e.target.closest('.act-stop');
+  const del = e.target.closest('.act-del');
+  const resume = e.target.closest('.act-resume');
+  if (stop) {
+    e.preventDefault();
+    const id = stop.dataset.id;
+    if (!confirm(`确定停止任务 #${id}？\n已发现的结果会保留并生成阶段性报告，之后可「继续」续跑。`)) return;
+    try { await SAP.api(`/api/tasks/${id}/stop`, { method: 'POST' }); SAP.toast('已请求停止', 'ok'); poll(); }
+    catch (err) { SAP.toast('停止失败：' + err.message, 'err'); }
+  } else if (resume) {
+    e.preventDefault();
+    const id = resume.dataset.id;
+    try { await SAP.api(`/api/tasks/${id}/resume`, { method: 'POST' }); SAP.toast('任务已续跑', 'ok'); poll(); }
+    catch (err) { SAP.toast('续跑失败：' + err.message, 'err'); }
+  } else if (del) {
+    e.preventDefault();
+    const id = del.dataset.id;
+    if (!confirm(`确定删除任务 #${id}（${del.dataset.name}）？\n漏洞记录、上传文件、工作区与报告将一并删除，不可恢复。`)) return;
+    try { await SAP.api(`/api/tasks/${id}`, { method: 'DELETE' }); SAP.toast('任务已删除', 'ok'); poll(); }
+    catch (err) { SAP.toast('删除失败：' + err.message, 'err'); }
+  }
+});
+
+poll();
+setInterval(poll, 3000);
+</script>
+{% endblock %}

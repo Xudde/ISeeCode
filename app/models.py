@@ -18,6 +18,9 @@ class Task(Base):
     status: Mapped[str] = mapped_column(String(32), default="pending")
     project_type: Mapped[str] = mapped_column(String(16), default="web")
     tech_stack: Mapped[str] = mapped_column(String(128), default="unknown")
+    fingerprint: Mapped[str] = mapped_column(Text, default="")  # 组件指纹（JSON：组件/语言分布/后缀统计）
+    audit_mode: Mapped[str] = mapped_column(String(16), default="full")  # full=完整审计；static=仅静态扫描（不消耗token）
+    tokens_used: Mapped[int] = mapped_column(Integer, default=0)  # Agent 阶段已消耗 token 估算
     workspace_path: Mapped[str] = mapped_column(String(512), default="")
     cancel_requested: Mapped[bool] = mapped_column(Boolean, default=False)  # 用户请求停止
     error_msg: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -37,6 +40,8 @@ class Vulnerability(Base):
     task_id: Mapped[int] = mapped_column(Integer, ForeignKey("tasks.id"))
     source: Mapped[str] = mapped_column(String(32), default="")
     rule_id: Mapped[str] = mapped_column(String(128), default="")
+    title: Mapped[str | None] = mapped_column(String(128), nullable=True)  # AI 生成的中文漏洞名（报告展示用）
+    precondition: Mapped[str | None] = mapped_column(String(512), nullable=True)  # 复现条件（如：需登录/匿名可达/需特定数据）
     severity: Mapped[str] = mapped_column(String(16), default="")
     file_path: Mapped[str] = mapped_column(String(512), default="")
     line: Mapped[int] = mapped_column(Integer, default=0)

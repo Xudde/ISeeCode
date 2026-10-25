@@ -1,8 +1,8 @@
-# 源码自动化审计平台（V2）
+# 源码自动化审计平台
 
-上传项目源码 → 自动化代码审计（semgrep + 官方规则包）→ Agent 深度研判（ReAct 全量审计）→ Docker 沙箱部署 → 自动/手动 POC 验证 → 生成可视化审计报告。
+上传项目源码 → 自动化代码审计（semgrep）→ LLM 误报研判 → Docker 沙箱自动部署 → POC 自动验证 → 生成 Markdown 审计报告。
 
-> 当前版本：**V2**（阶段 3.5 已完成，可交付使用）。支持 Web 源码 / APK / 二进制反编译审计、Agent 全量审计（覆盖未授权访问等逻辑漏洞）、沙箱保留手工验证、任务分区管理与一键停止/删除。
+> 当前进度：**阶段 0（项目骨架）已完成**。上传/扫描/沙箱/POC 功能将在后续阶段实现。
 
 ## 启动说明
 
@@ -24,27 +24,22 @@ uvicorn app.main:app --reload
 ## 目录结构
 
 - `app/` 后端代码（FastAPI 入口、模型、路由、任务队列、skills 模块）
-- `app/agent/` Agent 审计引擎（ReAct 循环、工具集、orchestrator 调度）
-- `app/skills/` 审计能力模块（semgrep 扫描、反编译、沙箱、POC、报告生成）
-- `app/audit_labels.py` 中文漏洞名映射（SQL 注入 / RCE / 未授权访问…）
 - `templates/` Jinja2 页面
 - `static/` 静态资源
-- `docs/` 架构设计文档与归档
-- `data/` 运行时数据（uploads / workspaces / reports / app.db，已加入 .gitignore）
+- `semgrep_rules/` 内置扫描规则（阶段 1 填充）
+- `docker_templates/` 沙箱镜像模板（阶段 2 填充）
+- `data/` 运行时数据（uploads / workspaces / reports，已加入 .gitignore）
 
 ## API 一览
 
 | 方法 | 路径 | 功能 |
 |---|---|---|
-| POST | /api/tasks/upload | 上传 zip/apk/二进制创建任务（SHA-256 去重，重复返回 409） |
+| POST | /api/tasks | 上传 zip 创建任务（阶段 1 实现） |
 | GET | /api/tasks | 任务列表 |
 | GET | /api/tasks/{id} | 任务详情 |
-| GET | /api/tasks/{id}/report | 下载审计报告 |
-| POST | /api/tasks/{id}/stop | 停止任务（立即销毁沙箱容器） |
-| DELETE | /api/tasks/{id} | 删除任务（彻底清理漏洞/上传/工作区/报告） |
-| POST | /api/tasks/{id}/poc-test | 手工验证：在保留的沙箱容器内发起 payload 请求并回显 |
-| GET | /api/tasks/{id}/poc-script/{vuln_id} | 下载独立可运行的 Python POC 脚本 |
-| GET/POST | /api/config | 获取 / 更新 LLM 配置（base_url / api_key / model，任意 OpenAI 兼容接口） |
+| GET | /api/tasks/{id}/report | 下载 Markdown 报告（阶段 1 实现） |
+| GET | /api/config | 获取配置（api_key 脱敏为 sk-***xxxx） |
+| POST | /api/config | 更新 LLM 配置 |
 
 
 ## 升级改造（阶段0 P0 修复完成）
@@ -105,26 +100,43 @@ pip install -r requirements.txt && uvicorn app.main:app --host 127.0.0.1 --port 
 4. **[Bug] route_map 重复条目**：同文件被多 pattern 重复命中，已去重
 5. **[清理] 历史文件归档**：`111.txt` 归档至 `docs/`；历史阶段 zip 包移至 `/workspace/archive/`
 
-## V2 版本（阶段 3.2~3.5：全 Agent 智能审计 + 可用性完善）
 
-### 阶段 3.2 Agent 全量审计（根治静态漏报）
-- 新增 `agent_full_audit` 流水线阶段：Agent 不依赖 semgrep 命中行，自主遍历全部源码发现静态规则难以覆盖的漏洞（未授权访问 / 越权 / 逻辑 / 链式漏洞），rule_id 前缀 `agent-discovered-`
-- 多轮迭代审计（默认 3 轮，`FULL_AUDIT_ROUNDS` 可调），允许第一轮漏报、后续轮次补全
-- 与静态命中按 文件+行号 去重，避免重复消耗 token
+## 升级改造（2026-10-25 大版本：报告双版本 + AI 命名/复现条件 + A/B/C 级修复）
 
-### 阶段 3.3 沙箱保留 + 手工验证 + 任务管理
-- Web 任务完成后沙箱容器**保留**（`sandbox_cid`/`sandbox_port` 落库），任务详情页可"手动验证"：编辑 payload 一键在沙箱内发请求查看回显；"下载 POC 脚本"导出独立可运行的 Python 脚本
-- **停止**任务立即销毁沙箱并终止 Agent；**删除**任务彻底清理漏洞记录/上传/工作区/报告；运行中任务需先停止再删除
-- 任务列表按"进行中 / 已完成"分区展示；漏洞类型显示人类易读中文名（SQL 注入 / 远程命令执行 / 未授权访问…），内部规则 ID 悬浮展示
+### 报告双版本
+- **人看版**：自包含 HTML（主）+ Markdown（存档），面向审计人员
+- **AI 版**：`task_{id}_report.json`（schema `source-audit-report/1.0`），结构化 task/summary/findings，附 `caveats` 数组显式说明「POC 未动态验证」「N 条未研判」等限定条件，供下游 AI/工单系统消费
+- 下载：`GET /api/tasks/{id}/report`（html）/ `?format=md` / `?format=json`
 
-### 阶段 3.4 POC payload 格式规范化 + UI 优化
-- POC payload 统一为干净请求包格式：`POST /route?action=xxx` + `注入参数=k`（action 进 query、注入参数进 body），去除用户困惑的 `body:` 前缀；解析器兼容新旧两种形态
-- 生成的 Python POC 脚本同步新格式（URL 含 action、data 含注入参数）
-- 页面优化：文件选择按钮修复（原生 input 隐藏，仅一个按钮）、主容器加宽、非全居中布局
+### AI 漏洞命名与复现条件
+- 报告生成前自动批量（20 条/批）为漏洞生成**中文漏洞名**（如「SQL注入（订单号拼接查询）」）与**复现条件**（如「需登录学生账号」「匿名可达，需有效订单号」）
+- 落库字段 `title` / `precondition`；前端漏洞表、三种报告均优先展示；Agent 研判结论（write_finding.precondition）优先于批量生成
 
-### 阶段 3.5 落库统一清洗
-- 所有 payload 落库前经 `normalize_payload()` 统一规范化，彻底清除 Agent 自由提交的 `body:` 残留
-- 清洗 semgrep 官方规则包注入的 "requires login" 页脚（`_clean_text`），报告不再出现该字符串
+### UI 2.x
+- 深浅双主题（白天蓝白 / 夜间黑灰，侧边栏切换按钮，记忆+跟随系统）；左侧导航布局
+- 任务列表/详情 SPA 式免刷新轮询；实时日志终端（时间戳着色/自动滚动/一键复制）；漏洞多维筛选（结论/等级/搜索）；拖拽上传+进度条
+- 自托管 Lato / Fira Code 字体，内网零外部 CDN 依赖
 
-### 推理模型兼容
-- deepseek-reasoner / o3 等推理模型不支持 `temperature` 参数，`_chat` 自动省略，可在配置页直接切换
+### 稳定性修复（A 级，均经真实任务回归）
+1. **反编译缓存 v2**：修复「共享输出目录被后处理二进制 rmtree 冲掉」的严重 bug（曾致 ASP.NET 发布包任务丢失全部控制器/鉴权源码，Agent 只能瞎猜路由与登录要求）；现在每个二进制私有临时目录 → 只缓存自身产物 → 合并进共享目录；v1 污染缓存自动失效
+2. **续跑去重**：重扫按 `(file_path, line, rule_id)` 复用已有漏洞记录，已研判条目不重复分析、不重复消耗 token；修复续跑预处理 `Is a directory` 崩溃（解压源改用 upload_path）
+3. **停止生效**：修复 worker 读取 ORM 缓存导致 API 写入的停止请求不可见的问题（db.refresh）
+4. **多栈沙箱**：tech_stack 逗号串按序逐栈尝试部署，多栈任务恢复 POC 与动态验证
+5. **tokens_used 落库**：Agent 研判与全量审计两阶段累计写入任务表
+
+### 修复（B 级）
+- http_request 工具：method 真正透传（原 POST 静默变 GET）、params/body 正确解析与 URL 编码
+- 全局沙箱并发闸唯一定义（原先两把信号量上限翻倍）
+- 删除任务仅限终态（封死「删除运行中任务 + rowid 复用 → 双跑」竞态）
+- token 估算 CJK 感知（中文 0.7 token/字）；POC 脚本 GET 参数 URL 编码；官方规则探测超时 90s→20s
+
+### 修复（C 级）与安全
+- **AUTH_TOKEN 默认启用**（start.sh 内置，浏览器访问 `http://<host>:8000/login?token=<AUTH_TOKEN>` 一次即写入 cookie；API 可带 `Authorization: Bearer <token>`）。修改 token 编辑 start.sh 后重启
+- 上传改流式落盘 + 增量哈希（不再整包进内存）；沙箱 exec 参数改 argv 传递（防特殊字符破坏脚本）；call_chain 过滤语言关键字噪音；移除未使用的 paramiko 依赖与空 semgrep_rules 目录；auth.py 登录死代码清理
+- 已知残留：LLM API Key 明文存于 SQLite（data/app.db），请确保平台仅部署于可信内网并保管服务器权限
+
+
+### 登录方式（2026-10-25 更新）
+- 浏览器访问 `http://<host>:8000/login`，使用账号密码登录（默认 `Xudde / 123456`，可在 `start.sh` 修改 `AUTH_USER/AUTH_PASS`）
+- 脚本/API 二选一：请求头 `Authorization: Bearer <AUTH_TOKEN>`，或 `GET /login?token=<AUTH_TOKEN>` 写 cookie
+- 登录失败有 1.2s 延时与日志记录；会话过期后页面自动跳回登录页

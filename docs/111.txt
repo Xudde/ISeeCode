@@ -1,0 +1,394 @@
+深度研究，我想要让ai开发一个投项目代码就自动化代码审计，自动部署，自动poc验证，存poc库的项目，你看看下面这个内容吧
+源码自动化审计平台 MVP 开发文档（AI IDE 分阶段投喂版）
+ 
+文档说明
+ 
+本文档面向 Trae Code / Cursor 等 AI 代码编辑器，采用分阶段交付、逐阶段验证的开发模式。每次仅向AI投喂单个阶段的需求，待代码生成、本地运行验证通过后，再投喂下一阶段，避免一次性生成全量代码导致结构混乱、依赖冲突、无法运行。
+ 
+ 
+ 
+一、通用使用流程
+ 
+1. 新建空项目目录，先投喂「总纲 + 阶段 0」内容，完成项目骨架搭建。
+2. 单个阶段代码生成后，在 Ubuntu 22.04 虚拟机环境中执行启动测试。
+3. 运行报错时，将完整 traceback 日志反馈给AI修复，直至通过验收标准。
+4. 上一阶段验收通过后，再投喂下一阶段完整需求。
+5. 禁止AI超前实现未到阶段的功能。
+ 
+ 
+ 
+二、总体技术约束（所有阶段强制遵守）
+ 
+类别 选型 说明 
+开发语言 Python 3.10+ 全量类型提示，关键函数带 docstring 
+Web框架 FastAPI + Uvicorn 异步入口，内置生命周期钩子 
+数据库 SQLite + SQLAlchemy 2.x 单文件零部署，ORM映射 
+任务调度 单worker线程 + 内存Queue 串行执行任务，不引入Celery/Redis 
+前端 Jinja2 + 原生HTML/JS 极简页面，禁止前后端分离框架 
+LLM调用 OpenAI 官方SDK 兼容OpenAI接口格式，base_url/api_key/model可配置 
+容器控制 docker-py Python包名： docker  
+静态扫描 semgrep 命令行  --json  格式输出结果 
+POC发包 httpx 高性能HTTP客户端 
+运行环境 Ubuntu 22.04 + Docker 已预装 所有依赖可通过pip一键安装 
+ 
+全局安全红线（硬编码实现，禁止仅注释说明）
+ 
+1. 上传文件仅接受  .zip  格式，单文件 > 200MB 直接拒绝；解压后总大小 > 1GB 终止任务。
+2. Zip Slip 防护：解压前逐条校验文件路径，包含  ..  或  /  开头的绝对路径，直接拒绝整个任务。
+3. 恶意样本初筛：解压后扫描顶层可执行文件（.exe/.dll）、脚本中出现  curl|bash|wget  等特征，命中则标记任务失败，不进入扫描环节。
+4. LLM API Key 仅存储于后端数据库，前端接口返回时脱敏展示为  sk-***xxxx 。
+5. Docker沙箱强制约束：禁止privileged模式、禁止host网络；默认限制  --memory=512m --cpus=1 --pids-limit=128 ；任务超时5分钟强制销毁容器。
+6. 任务执行全链路  try/except  包裹，任何异常不得导致worker线程退出。
+ 
+ 
+ 
+三、项目目录结构（严格遵循）
+ 
+plaintext
+  
+
+source-audit-platform/
+├── app/
+│   ├── init.py
+│   ├── main.py              # FastAPI 入口 + worker 线程启动
+│   ├── config.py            # 全局路径与常量配置
+│   ├── db.py                # SQLAlchemy 引擎与会话
+│   ├── models.py            # ORM 数据模型
+│   ├── schemas.py           # Pydantic 请求响应模型
+│   ├── queue_worker.py      # 串行任务队列消费器
+│   ├── routes/
+│   │   ├── init.py
+│   │   ├── pages.py         # 页面路由
+│   │   ├── api_tasks.py     # 任务管理API
+│   │   └── api_config.py    # LLM配置API
+│   └── skills/
+│       ├── init.py
+│       ├── preprocess.py    # 解压、清理、文件清单生成
+│       ├── tech_detect.py   # 技术栈自动识别
+│       ├── sast_semgrep.py  # semgrep 静态扫描
+│       ├── llm_judge.py     # LLM 漏洞误报研判
+│       ├── sandbox.py       # Docker 沙箱部署（阶段2实现）
+│       ├── poc_verify.py    # POC 自动验证（阶段2实现）
+│       └── report.py        # Markdown 审计报告生成
+├── templates/
+│   ├── base.html
+│   ├── index.html           # 上传页 + 任务列表
+│   ├── task_detail.html     # 任务详情 + 漏洞列表 + 执行日志
+│   └── config.html          # LLM 配置页
+├── static/
+│   └── style.css
+├── semgrep_rules/           # 内置扫描规则
+│   ├── python.yml
+│   ├── go.yml
+│   ├── php.yml
+│   └── javascript.yml
+├── docker_templates/        # 沙箱镜像模板（阶段2实现）
+│   ├── flask/
+│   ├── gin/
+│   └── php/
+├── data/                    # 运行时数据目录，加入.gitignore
+│   ├── uploads/
+│   ├── workspaces/
+│   └── reports/
+├── requirements.txt
+├── .gitignore
+└── README.md
+ 
+ 
+ 
+ 
+四、核心数据模型
+ 
+tasks 表（任务主表）
+ 
+字段 类型 说明 
+id int PK 自增 任务ID 
+filename str 上传原始文件名 
+status str 枚举 pending / preprocessing / sast / llm_judging / sandbox_deploying / poc_verifying / completed / failed / skipped 
+project_type str web / apk / os（MVP仅实现web） 
+tech_stack str flask / gin / php / unknown 
+workspace_path str 工作区绝对路径 
+error_msg text 可空 错误详情 
+log text 追加式执行日志，带时间戳 
+report_path str 可空 报告文件路径 
+created_at / updated_at datetime 创建/更新时间 
+ 
+vulnerabilities 表（漏洞明细表）
+ 
+字段 类型 说明 
+id int PK 自增 漏洞ID 
+task_id int FK 关联任务ID 
+source str 漏洞来源（semgrep） 
+rule_id str 扫描规则ID 
+severity str 严重等级 
+file_path str 漏洞文件相对路径 
+line int 漏洞行号 
+code_snippet text 漏洞代码片段 
+llm_is_real bool 可空 LLM研判是否为真实漏洞 
+llm_reason text 可空 LLM研判理由 
+llm_confidence str 可空 high / medium / low 
+poc_payload text 可空 POC载荷 
+poc_verified bool 可空 POC验证结果 
+verify_result text 可空 验证详情 
+created_at datetime 创建时间 
+ 
+config 表（系统配置表）
+ 
+字段 类型 说明 
+key str PK 配置项键名 
+value text 配置项值 
+ 
+ 
+ 
+五、核心模块接口约定
+ 
+所有skill模块严格遵循以下输入输出规范，禁止私自修改返回结构。
+ 
+1. preprocess.py 源码预处理
+ 
+python
+  
+
+def preprocess(zip_path: str, task_id: int) -> dict:
+    """
+    解压源码包并清理冗余文件
+    返回: {"workspace": str, "file_count": int, "files": list[str]}
+    """
+ 
+ 
+- 解压路径： data/workspaces/{task_id}/ 
+- 清理目录：node_modules / vendor / .git / pycache / dist / target
+- 过滤规则：单文件 > 5MB 且为二进制则跳过扫描
+ 
+2. tech_detect.py 技术栈识别
+ 
+python
+  
+
+def detect(workspace: str) -> str:
+    """根据项目特征文件识别技术栈，返回技术栈字符串"""
+ 
+ 
+识别优先级：
+ 
+- go.mod 存在 → 检查gin-gonic依赖 → "gin" / "go"
+- requirements.txt / manage.py → 检查flask依赖 → "flask" / "python"
+- composer.json / index.php → "php"
+- package.json → "node"
+- 其他 → "unknown"
+ 
+3. sast_semgrep.py 静态扫描
+ 
+python
+  
+
+def scan(workspace: str, tech_stack: str) -> list[dict]:
+    """调用semgrep扫描，返回标准化漏洞列表"""
+ 
+ 
+- 调用规则： semgrep_rules/{对应语言}.yml 
+- 输出格式： [{"rule_id","severity","file","line","code_snippet","message"}] 
+- 单规则结果上限200条，避免数据爆炸
+ 
+4. llm_judge.py LLM误报研判
+ 
+python
+  
+
+def judge_batch(vulns: list[dict], workspace: str, task_id: int) -> list[dict]:
+    """批量调用LLM研判漏洞真实性，返回补充研判结果的漏洞列表"""
+ 
+ 
+- 批量处理：每次最多5条，避免token溢出
+- 输出强制JSON格式： {"is_real": bool, "confidence": "high|medium|low", "reason": "...", "sink_reachable": bool} 
+- 解析失败兜底：标记 llm_is_real=None ，记录解析失败原因
+- 仅 is_real=true 且置信度为high/medium的漏洞进入下一阶段
+- 单任务最多研判50条漏洞，超出部分标记为低优先级跳过
+ 
+5. report.py 报告生成
+ 
+python
+  
+
+def generate(task, vulns) -> str:
+    """生成Markdown格式审计报告，返回报告文件路径"""
+ 
+ 
+报告结构：
+ 
+1. 审计报告标题 + 基本信息
+2. 漏洞汇总统计表
+3. 逐条漏洞详情（文件位置、代码片段、LLM研判、POC验证结果）
+ 
+ 
+ 
+六、API 接口规范
+ 
+方法 路径 功能 
+POST /api/tasks 上传zip源码包，创建任务，返回task_id 
+GET /api/tasks 获取任务列表 
+GET /api/tasks/{id} 获取任务详情+漏洞列表 
+GET /api/tasks/{id}/report 下载Markdown报告 
+GET /api/config 获取配置（api_key脱敏） 
+POST /api/config 更新LLM配置（base_url、api_key、model） 
+GET / 首页：上传入口 + 任务列表（3秒自动刷新） 
+GET /tasks/{id} 任务详情页 
+GET /config LLM配置页 
+ 
+ 
+ 
+七、分阶段投喂清单
+ 
+【阶段 0：项目骨架】
+ 
+投喂内容
+ 
+将本文档「二、总体技术约束」「三、项目目录结构」「四、核心数据模型」「六、API接口规范」+ 以下阶段目标投喂给AI：
+ 
+现在请实现【阶段 0：项目骨架】。
+交付范围：
+ 
+1. 完整目录结构创建
+2. requirements.txt 依赖清单
+3. 数据库初始化、config表读写接口
+4. FastAPI 入口启动、worker线程空框架
+5. 三个空白页面（首页、详情页、配置页）可正常访问
+6. /api/config 接口可保存、可读取，api_key前端脱敏
+7. README.md 中文启动说明
+禁止实现任何扫描、沙箱、研判逻辑。
+ 
+验收标准
+ 
+1. 执行  pip install -r requirements.txt  无报错
+2. 执行  uvicorn app.main:app --reload  服务正常启动
+3. 浏览器可访问  / 、 /config  页面
+4. 配置页提交base_url、api_key、model后，刷新页面配置保留
+5. 调用  /api/config  接口，api_key返回脱敏格式
+ 
+ 
+ 
+【阶段 1：上传 + 静态扫描 + LLM研判 + 报告生成】
+ 
+前置条件
+ 
+阶段0验收通过
+ 
+投喂内容
+ 
+将本文档「五、核心模块接口约定」「全局安全红线1-3条」+ 以下阶段目标投喂给AI：
+ 
+现在请实现【阶段 1：源码审计全链路】。
+交付范围：
+ 
+1. zip上传接口，实现文件大小校验、Zip Slip防护、恶意样本初筛
+2. 实现 preprocess、tech_detect、sast_semgrep、llm_judge、report 五个skill模块
+3. queue_worker 实现完整状态流转：pending → preprocessing → sast → llm_judging → completed
+4. 前端任务列表3秒自动刷新，详情页展示漏洞列表、执行日志、报告下载按钮
+5. semgrep_rules 目录内置4个语言规则文件，每个至少5条常见高危规则
+6. 技术栈识别为unknown时，任务标记skipped，仅保留扫描结果
+7. 未配置LLM时，自动跳过研判环节，llm_is_real字段保持为空
+ 
+内置规则要求：
+ 
+- Python：eval、os.system、subprocess shell=True、SQL字符串拼接、flask debug=True
+- PHP：eval、system、exec、反序列化、文件包含
+- Go：exec.Command命令拼接、SQL字符串拼接、路径遍历
+- JavaScript：eval、innerHTML、child_process.exec、v-html、location.hash注入
+ 
+验收标准
+ 
+1. 上传含SQL注入的Flask测试项目，任务可正常执行至completed状态
+2. 报告中可看到扫描出的漏洞，LLM研判字段有内容
+3. 不配置LLM时，任务流程可正常跑完，仅无研判结果
+4. 上传含 ../ 路径的恶意zip包，任务被拒绝，错误信息清晰
+5. 上传超过大小限制的文件，接口返回明确报错
+ 
+ 
+ 
+【阶段 2：Docker沙箱 + POC自动验证】
+ 
+前置条件
+ 
+阶段1验收通过
+ 
+投喂内容
+ 
+将本文档「全局安全红线第5条」+ 以下阶段目标投喂给AI：
+ 
+现在请实现【阶段 2：沙箱部署与POC验证】。
+交付范围：
+ 
+1. docker_templates 目录内置flask、gin、php三套镜像模板（Dockerfile + 启动脚本）
+2. sandbox.py 模块：根据技术栈匹配模板，自动拷贝源码、构建镜像、启动容器、动态映射端口、轮询检测服务就绪（超时60秒）
+3. poc_verify.py 模块：调用LLM生成POC脚本，子进程执行验证，限时15秒，根据回显判断漏洞是否可复现
+4. queue_worker 新增 sandbox_deploying、poc_verifying 两个状态
+5. 任务结束后强制销毁容器、清理工作空间（保留报告）
+6. 不支持的技术栈直接跳过POC环节，不报错
+ 
+注意：第一版不做复杂网络隔离，使用默认bridge网络，端口映射到宿主机；容器严格限制资源和运行时长。
+ 
+验收标准
+ 
+1. 上传可复现SQL注入的Flask靶场项目，可自动拉起容器
+2. POC验证成功，报告中 poc_verified 标记为true
+3. 不支持的技术栈（如node）自动跳过POC，任务正常结束
+4. 容器运行超时后自动销毁，无残留容器
+ 
+ 
+ 
+【阶段 3：APK静态审计】
+ 
+前置条件
+ 
+阶段2验收通过
+ 
+投喂内容
+ 
+现在请实现【阶段 3：APK静态审计】。
+交付范围：
+ 
+1. 新增apk项目类型，支持上传.apk文件
+2. 新增apktool反编译、jadx反编译skill模块
+3. 内置Android常见漏洞规则：明文密码、WebView漏洞、Intent注入、不安全加密、备份权限
+4. 仅做静态扫描，不做动态运行验证
+5. 报告适配APK漏洞展示格式
+ 
+验收标准
+ 
+1. 上传测试APK，可正常反编译并扫描出规则内漏洞
+2. 报告展示APK专属漏洞信息
+ 
+ 
+ 
+【阶段 4：OS镜像基线审计】
+ 
+前置条件
+ 
+阶段3验收通过
+ 
+投喂内容
+ 
+现在请实现【阶段 4：OS镜像基线审计】。
+交付范围：
+ 
+1. 新增os镜像项目类型，支持qcow2/iso格式
+2. 集成Lynis/OpenSCAP做静态配置基线扫描
+3. 内置等保三级基线检查规则
+4. 仅只读扫描，绝不启动镜像运行
+5. 生成基线合规报告
+ 
+验收标准
+ 
+1. 上传系统镜像，可正常执行基线扫描
+2. 输出合规性报告，标注不合规项
+ 
+ 
+ 
+八、排坑与调试指南
+ 
+1. LLM JSON解析：必须实现 extract_json() 兜底函数，优先匹配`json代码块，再做贪婪正则匹配，最后 json.loads 异常捕获，避免LLM输出额外文本导致解析失败。
+2. Semgrep规则：阶段1优先使用内置固定规则，不依赖 --config auto 联网模式，保证稳定性。
+3. Docker环境：运行前确认当前用户在docker组，避免权限报错；容器构建产生的root文件，清理时使用 shutil.rmtree(ignore_errors=True) 。
+4. 沙箱网络：第一版不做复杂iptables隔离，优先保证连通性；后续迭代再增加出站白名单控制。
+5. API成本控制：LLM研判设置单任务50条上限，批量调用控制频率，避免token消耗过快。
+6. Worker稳定性：所有任务逻辑加异常捕获，单任务失败不影响整个worker线程和后续任务。

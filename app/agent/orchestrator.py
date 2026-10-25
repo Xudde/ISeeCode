@@ -8,17 +8,17 @@ from pathlib import Path
 
 from sqlalchemy.orm import Session
 
-from app.config import (AGENT_CONCURRENCY, AGENT_TOKEN_BUDGET, SANDBOX_CONCURRENCY,
+from app.config import (AGENT_CONCURRENCY, AGENT_TOKEN_BUDGET,
                         FULL_AUDIT_ROUNDS, FULL_AUDIT_TOKEN_PER_ROUND, FULL_AUDIT_MAX_FINDINGS)
 from app.agent import react, tools as agent_tools
+from app.agent_settings import AGENT_SETTING_DEFAULTS
 from app.db import SessionLocal
 from app.models import Vulnerability
 from app.skills.poc import normalize_payload
 
 log = logging.getLogger("agent.orchestrator")
 
-# 沙箱动态验证全局并发闸（跨线程）
-_sandbox_sem = threading.Semaphore(SANDBOX_CONCURRENCY)
+# 沙箱并发闸唯一定义在 agent/tools.py（此处不再重复创建，否则全局上限翻倍）
 # token 预算全局记账（每任务）
 _budget_lock = threading.Lock()
 
@@ -39,11 +39,29 @@ class Budget:
             return not self.exhausted
 
 
+def _settings_or_default(settings: dict | None) -> dict:
+    """settings 为 None 时回落到 config.py 静态常量，保证默认行为不变。"""
+    if settings:
+        return settings
+    return {
+        "agent_max_vulns": AGENT_SETTING_DEFAULTS["agent_max_vulns"],
+        "agent_max_steps": AGENT_SETTING_DEFAULTS["agent_max_steps"],
+        "agent_concurrency": AGENT_CONCURRENCY,
+        "agent_token_budget": AGENT_TOKEN_BUDGET,
+        "full_audit_rounds": FULL_AUDIT_ROUNDS,
+        "full_audit_token_per_round": FULL_AUDIT_TOKEN_PER_ROUND,
+        "full_audit_max_findings": FULL_AUDIT_MAX_FINDINGS,
+    }
+
+
 def analyze_vulns(db: Session, vuln_rows, workspace: str, tech_stack: str,
-                  handle=None, llm_cfg: dict = None, cancel_check=None, log_fn=None) -> dict:
+                  handle=None, llm_cfg: dict = None, cancel_check=None, log_fn=None,
+                  settings: dict | None = None) -> dict:
     """对候选漏洞批量执行 Agent 深度研判，写回 agent_* 字段。
     返回 {verified, false_positive, unverified, error} 计数。
-    cancel_check：可选回调，返回 True 表示用户已请求停止，剩余候选不再分析。"""
+    cancel_check：可选回调，返回 True 表示用户已请求停止，剩余候选不再分析。
+    settings：Agent 引擎可调参数（并发/步数/token 预算），None 时用默认值。"""
+    st = _settings_or_default(settings)
     from openai import OpenAI
 
     log_fn = log_fn or (lambda m: None)
@@ -57,7 +75,7 @@ def analyze_vulns(db: Session, vuln_rows, workspace: str, tech_stack: str,
         return {"verified": 0, "false_positive": 0, "unverified": len(vuln_rows), "error": 0}
     client = OpenAI(base_url=llm_cfg["base_url"], api_key=llm_cfg["api_key"], timeout=90)
     model = llm_cfg.get("agent_model") or llm_cfg["model"]
-    budget = Budget()
+    budget = Budget(total=st["agent_token_budget"])
     counts = {"verified": 0, "false_positive": 0, "unverified": 0, "error": 0}
 
     lang = (tech_stack or "unknown").split(",")[0]
@@ -76,7 +94,8 @@ def analyze_vulns(db: Session, vuln_rows, workspace: str, tech_stack: str,
             "file_path": row.file_path, "line": row.line,
             "code_snippet": row.code_snippet, "message": row.verify_result or "",
         }
-        result = react.run_agent(vuln_dict, reg, client, model, budget.total - budget.used, log_fn)
+        result = react.run_agent(vuln_dict, reg, client, model, budget.total - budget.used,
+                                 log_fn, max_steps=st["agent_max_steps"])
         budget.consume(result.tokens_used)
         # 独立 Session 写回：Agent 并发线程共享同一 Session 会导致 commit 冲突
         # （SessionTransactionState.CLOSED），故每条结论由工作线程用独立会话落库。
@@ -90,6 +109,9 @@ def analyze_vulns(db: Session, vuln_rows, workspace: str, tech_stack: str,
                 explo = getattr(result, "exploitability", "")
                 evid = getattr(result, "evidence", "")
                 r.agent_evidence = (f"[exploitability={explo}] {evid}" if explo else evid)[:4000]
+                precond = (getattr(result, "precondition", "") or "").strip()
+                if precond and not (r.precondition or "").strip():
+                    r.precondition = precond[:512]
                 if result.verdict == "verified":
                     payload = getattr(result, "payload", "") or ""
                     if payload and not r.poc_payload:
@@ -102,7 +124,7 @@ def analyze_vulns(db: Session, vuln_rows, workspace: str, tech_stack: str,
             s.close()
         return row, result.verdict, result.reason, result
 
-    with ThreadPoolExecutor(max_workers=AGENT_CONCURRENCY) as pool:
+    with ThreadPoolExecutor(max_workers=st["agent_concurrency"]) as pool:
         futures = [pool.submit(work, row) for row in vuln_rows]
         for fut in as_completed(futures):
             try:
@@ -112,16 +134,28 @@ def analyze_vulns(db: Session, vuln_rows, workspace: str, tech_stack: str,
                 counts["error"] += 1
                 continue
             counts[verdict] = counts.get(verdict, 0) + 1
+    # 记录 token 消耗到任务表（前端展示成本）
+    try:
+        if vuln_rows:
+            t = db.get(Task, getattr(vuln_rows[0], "task_id", None))
+            if t is not None:
+                t.tokens_used = (t.tokens_used or 0) + int(budget.used)
+                db.commit()
+    except Exception:
+        pass
     return counts
 
 
 def full_audit(db: Session, task_id: int, workspace: str, tech_stack: str,
                handle=None, llm_cfg: dict = None, existing=None,
-               cancel_check=None, log_fn=None) -> dict:
+               cancel_check=None, log_fn=None, fingerprint_json: str = "",
+               settings: dict | None = None) -> dict:
     """Agent 全量审计：不依赖 semgrep 命中行，Agent 自主遍历全部源码发现漏洞
     （未授权访问/逻辑/链式漏洞等静态规则难覆盖的类型）。发现的漏洞写入 Vulnerability 表，
     rule_id 前缀 agent-discovered-。existing: [(file_path, line, rule_id), ...] 用于去重。
-    返回 {"found": n, "skipped": n, "error": n}。"""
+    返回 {"found": n, "skipped": n, "error": n}。
+    settings：Agent 引擎可调参数（轮次/每轮 token/每轮条数/步数），None 时用默认值。"""
+    st = _settings_or_default(settings)
     from openai import OpenAI
 
     log_fn = log_fn or (lambda m: None)
@@ -143,16 +177,29 @@ def full_audit(db: Session, task_id: int, workspace: str, tech_stack: str,
             seen.add((fp, int(ln or 0), rid))
     found, skipped, error = 0, 0, 0
 
-    for rnd in range(1, FULL_AUDIT_ROUNDS + 1):
+    rounds = st["full_audit_rounds"]
+    for rnd in range(1, rounds + 1):
         if cancel_check is not None and cancel_check():
             log_fn("检测到停止请求，中止全量审计")
             break
-        ctx = (f"这是第 {rnd}/{FULL_AUDIT_ROUNDS} 轮全量审计。"
+        ctx = (f"这是第 {rnd}/{rounds} 轮全量审计。"
                f"已确认 {found} 条新漏洞，请继续挖掘尚未覆盖的文件与攻击面；"
                f"不要重复提交已发现的 (file,line)。")
-        res = react.run_full_audit_round(reg, client, model, FULL_AUDIT_TOKEN_PER_ROUND,
-                                         log_fn, rnd, ctx)
-        for f in res.get("findings", []):
+        if fingerprint_json:
+            ctx += ("\n组件指纹（帮助判断框架与对应攻击面，如 Struts2→OGNL RCE、"
+                    "ThinkPHP→RCE、Fastjson→反序列化、Pickle→反序列化等）：\n"
+                    + fingerprint_json[:800])
+        res = react.run_full_audit_round(reg, client, model, st["full_audit_token_per_round"],
+                                         log_fn, rnd, ctx, max_steps=st["agent_max_steps"])
+        # 每轮结束记录 token 消耗到任务表（前端展示成本）
+        try:
+            t = db.get(Task, task_id)
+            if t is not None:
+                t.tokens_used = (t.tokens_used or 0) + int(res.get("tokens_used", 0) or 0)
+                db.commit()
+        except Exception:
+            pass
+        for f in res.get("findings", [])[:st["full_audit_max_findings"]]:
             fp = str(f.get("file_path", ""))
             try:
                 ln = int(f.get("line", 0) or 0)
@@ -181,6 +228,7 @@ def full_audit(db: Session, task_id: int, workspace: str, tech_stack: str,
                     agent_status="verified",
                     agent_confidence=str(f.get("confidence", "medium"))[:8],
                     agent_reason=str(f.get("reason", ""))[:1000],
+                    precondition=str(f.get("precondition", ""))[:512],
                     poc_payload=normalize_payload(str(f.get("payload", "")))[:500],
                     agent_evidence=(f"[exploitability={f.get('exploitability', 'none')}] "
                                     f"{f.get('evidence', '')}")[:4000],

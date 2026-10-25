@@ -16,6 +16,7 @@ SYSTEM_PROMPT = """你是资深代码安全审计 Agent。对给定的静态扫�
 当能下结论时调用 write_finding 工具：
 {"thought": "总结", "tool": "write_finding", "args": {"verdict": "verified|false_positive|unverified",
  "exploitability": "high|medium|low|none", "payload": "验证payload或空", "confidence": "high|medium|low",
+ "precondition": "复现条件：触发前提（如 匿名可达，无需登录 / 需登录管理员 / 需订单号存在数据库），无法确认写 待确认",
  "evidence": "证据链：source→中间处理→sink 行→动态结果（简洁中文）", "reason": "结论理由（中文）"}}"""
 
 AVAILABLE_TOOLS_DESC = ""
@@ -35,14 +36,20 @@ FULL_AUDIT_SYSTEM_PROMPT = """你是资深代码安全审计专家，对给定�
 3) 有 http_request/sandbox_exec 工具时，构造 payload 动态验证（仅针对本地沙箱，禁止外网）
 4) 每个漏洞必须给出精确的 file_path/line、漏洞类型与可复现 payload；过滤存在时写明绕过方式
 输出要求：审计完成（或步数将尽）时调用 write_finding 提交 findings 数组；数组元素字段：
-{"file_path","line","rule_id"(agent-discovered-sqli / -rce / -command / -file-read / -file-delete / -file-write / -unauth / -idor / -ssrf / -xxe / -deserialization / -ssti / -logic 等),"severity"(CRITICAL|HIGH|MEDIUM|LOW),"verdict"(verified|false_positive),"exploitability"(high|medium|low|none),"confidence","payload","evidence"(source→过滤→sink→动态验证结果，简洁中文),"reason"}
+{"file_path","line","rule_id"(agent-discovered-sqli / -rce / -command / -file-read / -file-delete / -file-write / -unauth / -idor / -ssrf / -xxe / -deserialization / -ssti / -logic 等),"severity"(CRITICAL|HIGH|MEDIUM|LOW),"verdict"(verified|false_positive),"exploitability"(high|medium|low|none),"confidence","payload","precondition"(复现条件：认证要求/数据依赖/环境依赖，如 匿名可达 / 需登录学生账号),"evidence"(source→过滤→sink→动态验证结果，简洁中文),"reason"}
 只提交 verified 的漏洞；未复现/存疑的不提交。没有新漏洞也要调用 write_finding 提交空 findings 数组。
 每步只输出一个 JSON 对象（不要多余文本）：{"thought":"简短思考","tool":"工具名","args":{...}}"""
 
 
 def _est_tokens(text: str) -> int:
-    """粗略 token 估算（中文~1.5字/token，英文~4字符/token）"""
-    return max(1, len(text) // 3)
+    """token 估算（CJK 感知）：中文约 0.7 token/字，ASCII 约 1 token/3.5 字符。
+    旧版 len//3 对纯中文低估约 2 倍，导致预算控制虚高。"""
+    t = str(text or "")
+    if not t:
+        return 1
+    cjk = sum(1 for ch in t if '\u2e80' <= ch <= '\u9fff' or '\uff00' <= ch <= '\uffef')
+    other = len(t) - cjk
+    return max(1, int(cjk * 0.7 + other / 3.5))
 
 
 def _chat(client, model: str, messages: list) -> str:
@@ -73,13 +80,17 @@ class AgentResult:
         self.evidence = ""
         self.payload = ""
         self.confidence = "low"
+        self.precondition = ""
         self.reason = ""
         self.steps_used = 0
         self.tokens_used = 0
 
 
-def run_agent(vuln: dict, tools: dict, client, model: str, token_budget: int, log_fn=None) -> AgentResult:
-    """对单条疑似漏洞执行 ReAct 循环。tools: {name: (func, desc)}"""
+def run_agent(vuln: dict, tools: dict, client, model: str, token_budget: int,
+              log_fn=None, max_steps: int | None = None) -> AgentResult:
+    """对单条疑似漏洞执行 ReAct 循环。tools: {name: (func, desc)}
+    max_steps：单条步数硬上限（None 时用默认 AGENT_MAX_STEPS）。"""
+    max_steps = max_steps or AGENT_MAX_STEPS
     log_fn = log_fn or (lambda m: None)
     result = AgentResult()
     tool_desc = "\n".join(f"- {name}: {desc}" for name, (_, desc) in tools.items())
@@ -94,7 +105,7 @@ def run_agent(vuln: dict, tools: dict, client, model: str, token_budget: int, lo
         {"role": "user", "content": vuln_desc},
     ]
 
-    for step in range(1, AGENT_MAX_STEPS + 1):
+    for step in range(1, max_steps + 1):
         if tokens >= token_budget:
             result.reason = f"token 预算耗尽（{tokens}），标记 unverified"
             log_fn(result.reason)
@@ -120,6 +131,7 @@ def run_agent(vuln: dict, tools: dict, client, model: str, token_budget: int, lo
             result.verdict = verdict if verdict in ("verified", "false_positive", "unverified") else "unverified"
             result.evidence = str(args.get("evidence", ""))[:4000]
             result.payload = str(args.get("payload", ""))[:500]
+            result.precondition = str(args.get("precondition", ""))[:500]
             result.confidence = str(args.get("confidence", "low"))[:8]
             explo = str(args.get("exploitability", "none")).lower()
             result.exploitability = explo if explo in ("high", "medium", "low", "none") else "none"
@@ -147,14 +159,17 @@ def run_agent(vuln: dict, tools: dict, client, model: str, token_budget: int, lo
 
     result.tokens_used = tokens
     if not result.reason:
-        result.reason = f"步数达上限 {AGENT_MAX_STEPS}，标记 unverified"
+        result.reason = f"步数达上限 {max_steps}，标记 unverified"
     return result
 
 
 def run_full_audit_round(tools: dict, client, model: str, token_budget: int, log_fn=None,
-                         round_no: int = 1, context: str = "") -> dict:
+                         round_no: int = 1, context: str = "",
+                         max_steps: int | None = None) -> dict:
     """全量审计单轮：Agent 自由遍历整个源码目录，write_finding 提交 findings 数组。
-    tools: {name: (func, desc)}；返回 {"findings": [...], "tokens_used": int, "reason": str}"""
+    tools: {name: (func, desc)}；返回 {"findings": [...], "tokens_used": int, "reason": str}
+    max_steps：单轮步数硬上限（None 时用默认 AGENT_MAX_STEPS）。"""
+    max_steps = max_steps or AGENT_MAX_STEPS
     log_fn = log_fn or (lambda m: None)
     tool_desc = "\n".join(f"- {name}: {desc}" for name, (_, desc) in tools.items())
     sys_prompt = FULL_AUDIT_SYSTEM_PROMPT + "\n\n可用工具:\n" + tool_desc + "\n\n" + context
@@ -166,7 +181,7 @@ def run_full_audit_round(tools: dict, client, model: str, token_budget: int, log
     findings: list[dict] = []
     reason = ""
 
-    for step in range(1, AGENT_MAX_STEPS + 1):
+    for step in range(1, max_steps + 1):
         if tokens >= token_budget:
             reason = f"token 预算耗尽（{tokens}），终止本轮"
             log_fn(reason)
@@ -212,6 +227,6 @@ def run_full_audit_round(tools: dict, client, model: str, token_budget: int, log
         messages.append({"role": "user", "content": f"Observation:\n{obs}\n\n继续审计（或全部完成时 write_finding 提交 findings 数组）。"})
 
     if not reason:
-        reason = f"第 {round_no} 轮步数达上限 {AGENT_MAX_STEPS}"
+        reason = f"第 {round_no} 轮步数达上限 {max_steps}"
     log_fn(f"round{round_no} 完成：提交 {len(findings)} 条候选（{reason}）")
     return {"findings": findings, "tokens_used": tokens, "reason": reason}
