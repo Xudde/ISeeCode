@@ -3,25 +3,60 @@ preprocess → tech_detect → sast → llm_judge → sandbox → poc → agent 
 支持协作式取消（用户停止）：阶段间检查 cancel_requested，取消时清理沙箱。
 任何异常不得导致线程退出。
 """
+import itertools
 import json
 import logging
+import os
 import queue
 import threading
 from datetime import datetime
 from pathlib import Path
 
 from app.db import SessionLocal
-from app.models import Task, Vulnerability
-from app.skills import apk_analyze, decompile, image_baseline, llm_judge, poc, preprocess, report, sast_semgrep, sandbox, tech_detect
+from app.models import AgentRun, Task, Vulnerability
+from app.skills import (apk_analyze, decompile, driver_analyze, image_baseline, llm_judge,
+                        poc, preprocess, report, sast_semgrep, sandbox, tech_detect)
 from app.agent_settings import agent_settings
 from app.agent import orchestrator
 
-task_queue: "queue.Queue[int]" = queue.Queue()
+# 阶段 0.4：优先级队列（poc 动态任务 > full > static），seq 防止同优先级比较 task_id
+task_queue: "queue.PriorityQueue[tuple[int, int, int]]" = queue.PriorityQueue()
+_queue_seq = itertools.count()
+
+# 全量审计熔断：实测千文件级仓库（GitLab 4000 文件 900 步 0 发现，147 万 token）
+# 投入产出比极低，默认按工作区文件数熔断。依赖/构建产物不计入。
+AUDIT_COUNT_SKIP_DIRS = {"node_modules", "vendor", "third_party", "thirdparty",
+                         "bower_components", ".git", ".svn", ".hg", "__pycache__",
+                         ".venv", "venv", "dist", "build", "target", "obj"}
+
+
+def count_audit_files(workspace: str) -> int:
+    """统计纳入全量审计范围的文件数（排除依赖/构建/VCS 目录，含 test/docs）"""
+    if not workspace or not os.path.isdir(workspace):
+        return 0
+    n = 0
+    for _, dirnames, filenames in os.walk(workspace):
+        dirnames[:] = [d for d in dirnames if d.lower() not in AUDIT_COUNT_SKIP_DIRS]
+        n += len(filenames)
+    return n
+
+
+# _log 会被 Agent 线程池的多个工作线程并发调用（共享同一 Session，
+# SQLAlchemy Session 非线程安全——并发 commit 会打坏会话导致任务卡死），必须串行化
+_log_lock = threading.Lock()
 
 
 def _log(db, task, msg: str) -> None:
-    task.log = (task.log or "") + f"[{datetime.now().strftime('%H:%M:%S')}] {msg}\n"
-    db.commit()
+    with _log_lock:
+        try:
+            task.log = (task.log or "") + f"[{datetime.now().strftime('%H:%M:%S')}] {msg}\n"
+            db.commit()
+        except Exception:
+            db.rollback()
+            try:
+                db.refresh(task)
+            except Exception:
+                pass
 
 
 def _gen_report(db, task, partial: bool = False) -> None:
@@ -35,7 +70,9 @@ def _gen_report(db, task, partial: bool = False) -> None:
             return
         try:
             llm_cfg = llm_judge.get_llm_config(db)
-            if llm_cfg is not None and any(not (r.title or "").strip() for r in db_vulns):
+            # 静态/POC 模式承诺 0 token：AI 命名也跳过
+            if (llm_cfg is not None and getattr(task, "audit_mode", "full") not in ("static", "poc")
+                    and any(not (r.title or "").strip() for r in db_vulns)):
                 _log(db, task, "为漏洞生成可读中文名称（LLM 批量命名）…")
                 n_named = llm_judge.name_vulns(db, task, db_vulns, llm_cfg,
                                                log_fn=lambda m: _log(db, task, m))
@@ -44,6 +81,7 @@ def _gen_report(db, task, partial: bool = False) -> None:
         except Exception as e:
             _log(db, task, f"漏洞命名失败（不影响报告）: {e}")
         report_vulns = [{
+            "id": r.id, "source": r.source,
             "rule_id": r.rule_id, "title": r.title, "precondition": r.precondition,
             "severity": r.severity, "file_path": r.file_path,
             "line": r.line, "code_snippet": r.code_snippet,
@@ -54,7 +92,15 @@ def _gen_report(db, task, partial: bool = False) -> None:
             "agent_confidence": r.agent_confidence, "agent_reason": r.agent_reason,
             "agent_payload": r.poc_payload,
         } for r in db_vulns]
-        report_path = report.run_report(task, report_vulns)
+        hot = None
+        try:
+            from app.skills import hotlist as hotlist_skill
+            hot = hotlist_skill.build(task, db_vulns, top_n=20)
+            if hot.get("items"):
+                _log(db, task, f"人工深挖清单：Top {len(hot['items'])} 文件（0 token）")
+        except Exception as e:
+            _log(db, task, f"深挖清单生成失败（不影响报告）: {e}")
+        report_path = report.run_report(task, report_vulns, hotlist=hot)
         task.report_path = report_path
         _log(db, task, f"报告已生成：{report_path}")
     except Exception as e:
@@ -108,9 +154,11 @@ def _process(task_id: int) -> None:
             return bool(task.cancel_requested)
 
         # 1. 预处理：APK/镜像/反编译直接分析；zip 解压 + 初筛
-        if task.project_type in ("apk", "image", "decompile"):
+        if task.project_type in ("apk", "image", "decompile", "driver"):
             task.status = "preprocessing"
-            _log(db, task, f"{task.project_type} 文件就绪，跳过解压")
+            ready = {"apk": "APK 文件", "image": "镜像文件", "decompile": "待反编译文件",
+                     "driver": "驱动文件"}.get(task.project_type, f"{task.project_type} 文件")
+            _log(db, task, f"{ready}就绪，跳过解压")
             vuln_dict_map = {}
         else:
             task.status = "preprocessing"
@@ -123,12 +171,20 @@ def _process(task_id: int) -> None:
                     _log(db, task, "复用已解压的工作区（续跑，上传原件缺失）")
                     result = {"workspace": str(src_path), "total_size": 0}
                 else:
-                    result = preprocess.run_preprocess(task, src_path)
+                    result = preprocess.run_preprocess(
+                        task, src_path, lambda m: _log(db, task, m))
                 task.workspace_path = result["workspace"]
                 suspicious = preprocess.pre_screen(result["workspace"])
                 if suspicious:
                     _log(db, task, f"恶意样本初筛发现可疑文件：{', '.join(suspicious[:10])}")
                 _log(db, task, f"解压完成，共 {result['total_size']} 字节")
+                nested_count = result.get("nested_count", 0)
+                if nested_count:
+                    _log(db, task, f"嵌套压缩包已展开：{nested_count} 个（最多 3 层 / 20 个，"
+                                   f"仍受 {preprocess.MAX_EXTRACT_SIZE // 1024 // 1024}MB 总大小限制）")
+                skipped_nested = result.get("nested_skipped") or []
+                if skipped_nested:
+                    _log(db, task, f"嵌套压缩包跳过 {len(skipped_nested)} 个（详情见上方日志/失败原因）")
             except Exception as e:
                 task.status = "failed"
                 task.error_msg = f"预处理失败: {e}"
@@ -145,6 +201,17 @@ def _process(task_id: int) -> None:
             try:
                 apk_info, vulns = apk_analyze.run_apk_analysis(task.workspace_path)
                 _log(db, task, f"APK 信息：{apk_info.get('package')} v{apk_info.get('version_name')}")
+                try:
+                    from app.skills import mobsf_scan
+                    mv = mobsf_scan.scan(
+                        task.workspace_path, lambda m: _log(db, task, f"  [mobsf] {m}"))
+                    if mv:
+                        for v in mv:
+                            v["file_path"] = task.filename
+                        vulns = list(vulns) + mv
+                        _log(db, task, f"MobSF APK 静态分析：新增 {len(mv)} 条")
+                except Exception as e:
+                    _log(db, task, f"MobSF 分析失败（跳过）: {e}")
             except Exception as e:
                 task.status = "failed"
                 task.error_msg = f"APK 分析失败: {e}"
@@ -183,7 +250,7 @@ def _process(task_id: int) -> None:
             dec_ws.mkdir(parents=True, exist_ok=True)
             try:
                 dec = decompile.decompile(task.workspace_path, str(dec_ws),
-                                          lambda m: _log(db, task, m))
+                                          lambda m: _log(db, task, m), native_deep=True)
             except Exception as e:
                 dec = {"ok": False, "degraded": True, "lang": "unknown", "info": str(e)}
                 _log(db, task, f"反编译异常: {e}")
@@ -207,6 +274,26 @@ def _process(task_id: int) -> None:
                     vulns = decompile.degrade_string_scan(task.workspace_path)
                 except Exception as e:
                     _log(db, task, f"降级扫描失败: {e}")
+        elif task.project_type == "driver":
+            task.tech_stack = "windows-driver"
+            task.status = "sast"
+            _log(db, task, "执行 Windows 驱动静态审计（PE 结构/导入/签名/攻击面启发式 + capa/Ghidra，0 token）…")
+            try:
+                from app.config import WORKSPACE_DIR
+                artifact_dir = str(WORKSPACE_DIR / f"task_{task.id}_driver_decompiled")
+                drv = driver_analyze.analyze(
+                    task.workspace_path, lambda m: _log(db, task, f"  [driver] {m}"),
+                    deep=True, artifact_dir=artifact_dir)
+                vulns = drv["findings"]
+                for v in vulns:
+                    v["file_path"] = task.filename  # 上传落盘名带时间戳，展示用原始文件名
+                task.fingerprint = json.dumps(drv["fingerprint"], ensure_ascii=False)
+                _log(db, task, f"驱动静态审计完成：{len(vulns)} 条风险/线索（启发式，需人工复核）")
+            except Exception as e:
+                task.status = "failed"
+                task.error_msg = f"驱动审计失败: {e}"
+                _log(db, task, f"驱动审计失败: {e}")
+                return
         elif task.project_type == "web":
             # 混合包支持：解压目录内若含编译产物（dll/exe/jar 等），先批量反编译
             # 用户常见场景：上传"整体打包的编译产物 zip"（如 ASP.NET 发布目录），
@@ -238,33 +325,143 @@ def _process(task_id: int) -> None:
             except Exception as e:
                 _log(db, task, f"混合包反编译检测异常: {e}")
             techs = tech_detect.run_tech_detect_multi(task.workspace_path)
-            tech = techs[0] if techs else "unknown"
-            task.tech_stack = ",".join(techs) if techs else "unknown"
-            _log(db, task, f"识别技术栈：{task.tech_stack}")
-            if not techs:
-                task.status = "skipped"
-                task.error_msg = "未能识别代码语言栈（压缩包内可能不含源码文件），已跳过扫描"
-                _log(db, task, "未能识别代码语言栈（压缩包内可能不含源码文件），任务标记为 skipped")
-                return
+            sys_files = []
+            try:
+                sys_files = [p for p in Path(task.workspace_path).rglob("*.sys")
+                             if p.is_file() and p.stat().st_size <= 200 * 1024 * 1024][:20]
+            except OSError:
+                pass
+            if not techs and sys_files:
+                task.tech_stack = "windows-driver"
+                task.audit_mode = "static"
+                _log(db, task, f"未识别到源码栈，但发现 {len(sys_files)} 个 Windows 驱动（.sys），"
+                               f"进入驱动静态审计（自动切为静态模式，不消耗 token）")
+            else:
+                task.tech_stack = ",".join(techs) if techs else "unknown"
+                _log(db, task, f"识别技术栈：{task.tech_stack}")
+                if not techs:
+                    task.status = "skipped"
+                    task.error_msg = "未能识别代码语言栈（压缩包内可能不含源码文件），已跳过扫描"
+                    _log(db, task, "未能识别代码语言栈（压缩包内可能不含源码文件），任务标记为 skipped")
+                    return
             # 组件指纹识别：审计前先摸清组件/语言分布，供展示与 Agent 参考
             try:
                 from app.skills import fingerprint
                 fp = fingerprint.fingerprint(task.workspace_path)
+                if sys_files:
+                    comps = fp.setdefault("components", [])
+                    if "Windows Kernel Driver" not in comps:
+                        comps.append("Windows Kernel Driver")
                 task.fingerprint = json.dumps(fp, ensure_ascii=False)
                 _log(db, task, f"组件指纹：{fingerprint.format_fingerprint(fp)}")
             except Exception as e:
                 _log(db, task, f"组件指纹识别异常: {e}")
             task.status = "sast"
-            _log(db, task, "执行 semgrep 静态扫描…")
-            try:
-                vulns = sast_semgrep.run_sast(task.workspace_path, techs)
-            except Exception as e:
-                task.status = "failed"
-                task.error_msg = f"静态扫描失败: {e}"
-                _log(db, task, f"静态扫描失败: {e}")
-                return
+            if techs:
+                _log(db, task, "执行 semgrep 静态扫描…")
+                try:
+                    vulns = sast_semgrep.run_sast(task.workspace_path, techs)
+                except Exception as e:
+                    task.status = "failed"
+                    task.error_msg = f"静态扫描失败: {e}"
+                    _log(db, task, f"静态扫描失败: {e}")
+                    return
+            else:
+                vulns = []
+                _log(db, task, "无源码栈：跳过 semgrep，仅执行驱动静态审计")
+            if sys_files:
+                _log(db, task, f"对 {len(sys_files)} 个 Windows 驱动执行静态审计…")
+                if len(sys_files) > 3:
+                    _log(db, task, "capa/Ghidra 深度分析仅前 3 个驱动（避免多驱动批量过慢）")
+                from app.config import WORKSPACE_DIR
+                artifact_dir = str(WORKSPACE_DIR / f"task_{task.id}_driver_decompiled")
+                drv_vulns = []
+                for idx, sp in enumerate(sys_files):
+                    try:
+                        drv = driver_analyze.analyze(
+                            str(sp), lambda m: _log(db, task, f"  [driver] {m}"),
+                            deep=(idx < 3), artifact_dir=artifact_dir)
+                        rel = str(sp.relative_to(task.workspace_path)).replace("\\", "/")
+                        for v in drv["findings"]:
+                            v["file_path"] = rel
+                            drv_vulns.append(v)
+                        _log(db, task, f"  驱动 {rel}: {len(drv['findings'])} 条线索")
+                    except Exception as e:
+                        _log(db, task, f"  驱动 {sp.name} 分析失败（跳过）: {e}")
+                vulns = list(vulns) + drv_vulns
         if _maybe_cancel(db, task):
             return
+
+        # 2.8 巨人组合扫描（零 token 全离线）：授权/配置规则包 + gitleaks + trivy
+        if task.project_type == "driver":
+            _log(db, task, "驱动任务由专用引擎分析，跳过巨人组合扫描（如需密钥扫描请打包为 zip 上传）")
+        else:
+            try:
+                from app.skills import giants
+                g_ws = task.workspace_path
+                if task.project_type == "decompile":
+                    # 反编译任务：扫反编译产物而不是二进制原件
+                    from app.config import WORKSPACE_DIR
+                    dec = WORKSPACE_DIR / f"task_{task.id}" / "decompiled"
+                    if dec.is_dir():
+                        g_ws = str(dec)
+                eng_settings = agent_settings(db)
+                gv = giants.run_giants(
+                    g_ws, lambda m: _log(db, task, f"  [giants] {m}"),
+                    task_name=task.filename, settings=eng_settings)
+                if gv:
+                    vulns = list(vulns) + gv
+                    _log(db, task, f"巨人组合扫描：新增 {len(gv)} 条（0 token）")
+            except Exception as e:
+                _log(db, task, f"巨人组合扫描失败（跳过，不影响任务）: {e}")
+
+        # 6.8 SourceMap 还原产物补扫：giants 的 JS 情报在 semgrep 之后才写出原始 TS/Vue/JSX，
+        # 这里对还原目录补跑一次，避免“还原了但没审计”。
+        recovered_dir = Path(task.workspace_path) / "_sourcemap_recovered"
+        if recovered_dir.is_dir():
+            try:
+                recovered_files = [p for p in recovered_dir.rglob("*") if p.is_file()]
+                if recovered_files:
+                    _log(db, task, f"对 SourceMap 还原的 {len(recovered_files)} 个源码文件补跑 semgrep…")
+                    rv = sast_semgrep.run_sast(
+                        str(recovered_dir), ["typescript", "javascript"])
+                    if rv:
+                        vulns = list(vulns) + rv
+                        _log(db, task, f"SourceMap 还原源码补扫：新增 {len(rv)} 条")
+                    else:
+                        _log(db, task, "SourceMap 还原源码补扫：无新命中")
+            except Exception as e:
+                _log(db, task, f"SourceMap 还原源码补扫失败（跳过）: {e}")
+
+        # 未授权接口清单：静态候选落库（不自动发写请求；沙箱探测走任务页按钮/API）
+        if task.project_type == "web" and (eng_settings.get("engine_authz", 1) == 1):
+            try:
+                from app.skills import authz_inventory
+                inv = authz_inventory.scan(task.workspace_path)
+                af = authz_inventory.to_findings(inv)
+                if af:
+                    vulns = list(vulns) + af
+                    s = inv.get("summary") or {}
+                    _log(db, task, f"未授权接口候选：{s.get('endpoints', 0)} 个接口，"
+                                   f"{s.get('candidates', 0)} 个未发现鉴权标记，"
+                                   f"落库 {len(af)} 条（静态，未动态验证）")
+                else:
+                    _log(db, task, "未授权接口候选：无高信号候选")
+            except Exception as e:
+                _log(db, task, f"未授权接口清单失败（跳过，不影响任务）: {e}")
+
+        # 阶段 1：框架级鉴权语义（Django/Spring/Express），输出匿名/登录/角色/条件放行标签
+        if task.project_type == "web" and (eng_settings.get("engine_authz", 1) == 1):
+            try:
+                from app.skills import authz_semantic
+                sem = authz_semantic.scan(task.workspace_path)
+                authz_semantic.store(db, task.id, sem)
+                s = sem.get("summary") or {}
+                _log(db, task, f"鉴权语义：{s.get('endpoints', 0)} 个接口，标签 "
+                               f"{json.dumps(s.get('by_label') or {}, ensure_ascii=False)}")
+            except Exception as e:
+                _log(db, task, f"鉴权语义分析失败（跳过，不影响任务）: {e}")
+
         _log(db, task, f"静态扫描完成，发现 {len(vulns)} 条疑似漏洞")
 
         # 落库（续跑兼容：同位置同规则已有记录则复用，不重复落库——
@@ -280,10 +477,17 @@ def _process(task_id: int) -> None:
             if row is None:
                 row = Vulnerability(
                     task_id=task.id,
-                    source={"apk": "apk", "image": "image"}.get(task.project_type, "semgrep"),
+                    source=v.get("source") or {"apk": "apk", "image": "image",
+                                               "driver": "native"}.get(task.project_type, "semgrep"),
                     rule_id=v["rule_id"],
+                    title=v.get("title"),
                     severity=v["severity"], file_path=v["file_path"],
                     line=v["line"], code_snippet=v["code_snippet"],
+                    precondition=v.get("precondition"),
+                    poc_payload=v.get("poc_payload"),
+                    poc_verified=v.get("poc_verified"),
+                    verify_result=v.get("verify_result"),
+                    agent_evidence=v.get("agent_evidence"),
                 )
                 db.add(row)
                 existing_rows[key] = row
@@ -293,12 +497,24 @@ def _process(task_id: int) -> None:
         if new_cnt < len(vulns):
             _log(db, task, f"续跑兼容：复用已有漏洞记录 {len(vulns) - new_cnt} 条（含研判结果），新落库 {new_cnt} 条")
 
+        # 阶段 3：利用链引擎 v1（入口来自鉴权语义，sink 来自漏洞候选）
+        try:
+            from app.skills import chain_engine
+            n_chain = chain_engine.generate_and_store(db, task.id)
+            if n_chain:
+                _log(db, task, f"利用链引擎：生成 {n_chain} 条静态链候选（待动态验证）")
+        except Exception as e:
+            _log(db, task, f"利用链引擎失败（跳过，不影响任务）: {e}")
+
         # 4. 读取 LLM 配置（供 Agent 深度研判使用）。
         task.status = "llm_judging"
         llm_cfg = llm_judge.get_llm_config(db)
         if task.audit_mode == "static":
             llm_cfg = None
             _log(db, task, "仅静态扫描模式：跳过 Agent 深度研判与全量审计（不消耗 token），即将生成报告")
+        elif task.audit_mode == "poc":
+            llm_cfg = None
+            _log(db, task, "沙箱 POC 验证模式：跳过 Agent 与全量审计（0 token），仅部署沙箱并验证命中")
         elif llm_cfg is None:
             _log(db, task, "未配置 LLM，跳过 Agent 深度研判")
         else:
@@ -316,6 +532,9 @@ def _process(task_id: int) -> None:
         elif task.project_type == "decompile":
             handle = None
             _log(db, task, "反编译任务为静态分析，跳过 POC 验证")
+        elif task.project_type == "driver":
+            handle = None
+            _log(db, task, "驱动任务为静态审计，跳过沙箱部署与 POC 验证")
         elif task.audit_mode == "static":
             handle = None
             _log(db, task, "仅静态扫描模式：跳过沙箱部署与 POC 验证")
@@ -336,7 +555,7 @@ def _process(task_id: int) -> None:
         # 6. POC 验证
         task.status = "poc_verifying"
         if handle is None:
-            if task.project_type not in ("apk", "image", "decompile"):
+            if task.project_type not in ("apk", "image", "decompile", "driver"):
                 _log(db, task, "沙箱部署失败/不支持，跳过 POC 验证")
         else:
             try:
@@ -353,6 +572,8 @@ def _process(task_id: int) -> None:
         st = agent_settings(db)
         if llm_cfg is None:
             _log(db, task, "未配置 LLM，跳过 Agent 深度研判")
+        elif task.project_type == "driver":
+            _log(db, task, "驱动任务为静态启发式审计，跳过 Agent 深度研判（避免对二进制臆测）")
         else:
             task.status = "agent_analyzing"
             # 续跑场景：跳过已研判的漏洞（agent_status 非空），不重复消耗 token
@@ -390,22 +611,31 @@ def _process(task_id: int) -> None:
             if task.project_type == "decompile":
                 from app.config import WORKSPACE_DIR
                 audit_ws = str(WORKSPACE_DIR / f"task_{task.id}" / "decompiled")
-            task.status = "agent_full_audit"
-            _log(db, task, "启动 Agent 全量审计（自主遍历全部源码，不依赖静态规则命中）…")
-            try:
-                existing = [(r.file_path, r.line, r.rule_id)
-                            for r in db.query(Vulnerability).filter(Vulnerability.task_id == task.id).all()]
-                fcounts = orchestrator.full_audit(
-                    db, task.id, audit_ws, task.tech_stack,
-                    handle=handle, llm_cfg=llm_cfg, existing=existing,
-                    cancel_check=_cc,
-                    fingerprint_json=task.fingerprint,
-                    log_fn=lambda m: _log(db, task, f"  [full-audit] {m}"),
-                    settings=st)
-                _log(db, task, f"全量审计完成：新增 {fcounts.get('found', 0)} 条 verified，"
-                               f"跳过重复 {fcounts.get('skipped', 0)}，落库失败 {fcounts.get('error', 0)}")
-            except Exception as e:
-                _log(db, task, f"全量审计异常（不影响任务完成）: {e}")
+            audit_files = count_audit_files(audit_ws)
+            max_files = int(st["full_audit_max_files"])
+            if audit_files > max_files:
+                _log(db, task, f"全量审计已熔断：工作区 {audit_files} 个文件 > 上限 {max_files}。"
+                               f"实测千文件级仓库全量审计产出极低且消耗百万级 token，本次跳过（0 token）。"
+                               f"如确需执行，可在平台设置调高 full_audit_max_files。")
+            else:
+                task.status = "agent_full_audit"
+                _log(db, task, f"启动 Agent 全量审计（工作区 {audit_files} 个文件，熔断阈值 {max_files}；"
+                               f"自主遍历全部源码，不依赖静态规则命中）…")
+                try:
+                    existing = [(r.file_path, r.line, r.rule_id)
+                                for r in db.query(Vulnerability).filter(Vulnerability.task_id == task.id).all()]
+                    fcounts = orchestrator.full_audit(
+                        db, task.id, audit_ws, task.tech_stack,
+                        handle=handle, llm_cfg=llm_cfg, existing=existing,
+                        cancel_check=_cc,
+                        fingerprint_json=task.fingerprint,
+                        log_fn=lambda m: _log(db, task, f"  [full-audit] {m}"),
+                        settings=st)
+                    _log(db, task, f"全量审计完成：新增 {fcounts.get('found', 0)} 条 verified，"
+                                   f"升级已有 {fcounts.get('upgraded', 0)} 条，"
+                                   f"跳过重复 {fcounts.get('skipped', 0)}，落库失败 {fcounts.get('error', 0)}")
+                except Exception as e:
+                    _log(db, task, f"全量审计异常（不影响任务完成）: {e}")
         if _maybe_cancel(db, task, handle):
             return
 
@@ -453,6 +683,25 @@ def recover_pending_tasks() -> int:
     n = 0
     try:
         db = SessionLocal()
+        # 阶段 0.5：清理已删任务遗留的深挖会话（FK 未强制，孤儿 run 会污染新任务状态）
+        try:
+            db.query(AgentRun).filter(~AgentRun.task_id.in_(db.query(Task.id))).delete(
+                synchronize_session=False)
+            db.commit()
+        except Exception:
+            db.rollback()
+        # 阶段 0.3/0.6：启动时清理已退出沙箱的失效引用与容器，避免 runtime_ready 误报
+        try:
+            stale = db.query(Task).filter(Task.sandbox_cid.isnot(None)).all()
+            for t in stale:
+                if not sandbox.is_running(t.sandbox_cid):
+                    sandbox.cleanup_cid(t.sandbox_cid)
+                    t.sandbox_cid = None
+                    t.sandbox_port = None
+                    t.log = (t.log or "") + "[recover] 沙箱容器已退出，清理失效引用\n"
+            db.commit()
+        except Exception:
+            db.rollback()
         non_terminal = ("pending", "preprocessing", "sast", "llm_judging", "agent_analyzing",
                         "agent_full_audit", "sandbox_deploying", "poc_verifying", "reporting")
         rows = db.query(Task).filter(Task.status.in_(non_terminal)).all()
@@ -460,7 +709,7 @@ def recover_pending_tasks() -> int:
             if t.status != "pending":
                 t.log = (t.log or "") + f"[recover] 服务重启，任务从 {t.status} 重置为 pending\n"
                 t.status = "pending"
-            task_queue.put(t.id)
+            enqueue(t.id)
             n += 1
         db.commit()
         db.close()
@@ -477,8 +726,20 @@ def _worker_loop() -> None:
     log = logging.getLogger("audit-platform.worker")
     while True:
         try:
-            task_id = task_queue.get()
+            _, _, task_id = task_queue.get()
             _process(task_id)
+            # 兜底：_process 返回但任务未到终态（会话被打坏导致兜底自身失败时发生），
+            # 用新会话强制标记 failed，防止任务永久卡在中间状态
+            s = SessionLocal()
+            try:
+                t = s.get(Task, task_id)
+                if t is not None and t.status not in ("completed", "failed", "skipped", "cancelled"):
+                    t.status = "failed"
+                    t.error_msg = f"任务处理异常退出（原状态 {t.status}），已由 worker 兜底标记失败，可点「继续任务」续跑"
+                    s.commit()
+                    log.error(f"任务 {task_id} 处理返回后未到终态，已兜底标记 failed")
+            finally:
+                s.close()
         except Exception as e:  # noqa: BLE001
             # 异常写服务端日志，不再静默吞掉
             try:
@@ -494,4 +755,14 @@ def start_worker() -> threading.Thread:
 
 
 def enqueue(task_id: int) -> None:
-    task_queue.put(task_id)
+    """阶段 0.4：poc（动态验证）优先于 full，full 优先于 static；同优先级按入队顺序。"""
+    priority = 2
+    try:
+        db = SessionLocal()
+        t = db.get(Task, task_id)
+        mode = (t.audit_mode or "") if t is not None else ""
+        priority = 0 if mode == "poc" else (1 if mode == "full" else 2)
+        db.close()
+    except Exception:
+        priority = 2
+    task_queue.put((priority, next(_queue_seq), int(task_id)))

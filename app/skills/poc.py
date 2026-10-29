@@ -63,7 +63,10 @@ def extract_route(workspace: str, file_path: str, line: int) -> str | None:
     candidates = [
         re.compile(r'@app\.route\(\s*["\']([^"\']+)'),
         re.compile(r'@router\.(?:get|post|route)\(\s*["\']([^"\']+)'),
-        re.compile(r'@(?:GetMapping|PostMapping|RequestMapping)\(\s*["\']?([^"\'),]+)'),
+        re.compile(r'@(?:GetMapping|PostMapping|PutMapping|DeleteMapping|RequestMapping)\(\s*["\']?([^"\'),]+)'),
+        # Express / Koa: app.get('/x'), router.post("/x")
+        re.compile(r'(?:app|router)\.(?:get|post|put|delete|patch)\(\s*["\']([^"\']+)'),
+        # Next.js / Nuxt 常见 API 文件路径（由调用方补）
     ]
     try:
         full = Path(workspace) / file_path
@@ -180,6 +183,44 @@ if __name__ == '__main__':
 """
 
 
+def extract_flask_endpoint(workspace: str, file_path: str, line: int) -> dict | None:
+    """Flask 路由 + 表单参数：@app.route("/lab1", methods=["GET","POST"])
+    + request.form.get("domain") -> {route, method, param}"""
+    try:
+        lines = (Path(workspace) / file_path).read_text(errors="ignore").splitlines()
+    except OSError:
+        return None
+    route = None
+    methods = []
+    deco_idx = None
+    route_re = re.compile(
+        r'@app\.route\(\s*["\']([^"\']+)["\'](?:[^)]*methods\s*=\s*\[([^\]]+)\])?')
+    for i in range(min(max(line, 1), len(lines)) - 1, -1, -1):
+        m = route_re.search(lines[i])
+        if m:
+            route, methods, deco_idx = m.group(1), (m.group(2) or "").upper(), i
+            break
+    if not route or deco_idx is None:
+        return None
+    param = None
+    used_form = False
+    for i in range(deco_idx + 1, min(len(lines), deco_idx + 250)):
+        if i > deco_idx + 1 and re.match(r"\s*@|def\s+", lines[i]):
+            break
+        for m in re.finditer(
+                r'request\.(form|args)(?:\.get\(\s*["\']([^"\']+)["\']|\[\s*["\']([^"\']+)["\']\s*\])',
+                lines[i]):
+            param = m.group(2) or m.group(3)
+            used_form = m.group(1) == "form"
+            break
+        if param:
+            break
+    if not param:
+        return None
+    method = "POST" if used_form or "POST" in methods else "GET"
+    return {"route": route, "method": method, "param": param}
+
+
 def _php_payload(php: dict | None, rule: str) -> dict | None:
     """PHP action 分发下的 payload；键优先匹配语义（file/url/id 等）"""
     if not php:
@@ -244,14 +285,48 @@ def build_poc(vuln: dict, workspace: str = "") -> dict | None:
         if php_poc:
             return php_poc
 
+    # Flask/FastAPI 表单/查询参数：让 /lab1 这类 POST 表单也能自动 POC
+    if str(fp).lower().endswith(".py"):
+        ep = extract_flask_endpoint(workspace, fp, line)
+        if ep:
+            key = ep["param"]
+            base = {"route": ep["route"], "method": ep["method"], "params": {key: ""}}
+            if "sql-injection" in rule:
+                base["params"][key] = "1 OR 1=1"
+                base["expect"] = ["sql", "syntax", "error", "mysql", "warning", "pdo", "exception"]
+                return base
+            if ("command-injection" in rule or "command-line-injection" in rule
+                    or "tainted-exec" in rule):
+                base["params"][key] = "127.0.0.1;sleep 3"
+                base["expect"] = ["uid=", "gid="]
+                return base
+            if ("eval-exec" in rule or "code-injection" in rule
+                    or "code-execution" in rule):
+                base["params"][key] = "1+1"
+                base["expect"] = ["2"]
+                return base
+            if "template" in rule or "ssti" in rule or "render-template" in rule:
+                base["params"][key] = "{{7*7}}"
+                base["expect"] = ["49"]
+                return base
+            if "xss" in rule or "echoed-request" in rule:
+                base["params"][key] = "<b>POC_XSS</b>"
+                base["expect"] = ["<b>poc_xss</b>"]
+                return base
+
     if "sql-injection" in rule:
         return {"route": route, "params": {"id": "1 OR 1=1"},
                 "expect": ["sql", "syntax", "error", "sqlite", "mysql", "union", "warning"]}
-    if "command-injection" in rule:
+    if ("command-injection" in rule or "command-line-injection" in rule
+            or "tainted-exec" in rule):
         return {"route": route, "params": {"host": "127.0.0.1;id"},
                 "expect": ["uid=", "gid="]}
     if "eval-exec" in rule or "code-injection" in rule or "code-execution" in rule:
         return {"route": route, "params": {"expr": "1+1"}, "expect": ["2"]}
+    if "template" in rule or "ssti" in rule or "render-template" in rule:
+        return {"route": route, "params": {"name": "{{7*7}}"}, "expect": ["49"]}
+    if "tainted-callable" in rule or "call_user_func" in rule:
+        return {"route": route, "params": {"fn": "system", "arg": "id"}, "expect": ["uid=", "gid="]}
     if "path-traversal" in rule or "file-inclusion" in rule:
         return {"route": route,
                 "params_list": [
@@ -263,7 +338,7 @@ def build_poc(vuln: dict, workspace: str = "") -> dict | None:
                 "expect": ["root:", "/bin/"]}
     if "ssrf" in rule:
         return {"route": route, "params": {"url": "http://127.0.0.1:80"}, "expect": []}
-    if "xss" in rule:
+    if "xss" in rule or "echoed-request" in rule:
         return {"route": route, "params": {"name": "<b>POC_XSS</b>"},
                 "expect": ["<b>poc_xss</b>"]}
     if "deserialization" in rule or "pickle" in rule:
@@ -296,13 +371,18 @@ def verify(vuln: dict, workspace: str, handle) -> tuple[bool, str]:
     rule = vuln["rule_id"].lower()
 
     # 命令注入：时序盲注检测（sleep 3 与基线请求对比）
-    if "command-injection" in rule:
+    if ("command-injection" in rule or "command-line-injection" in rule
+            or "tainted-exec" in rule):
         try:
+            params = poc.get("params") or {}
+            key = "host" if "host" in params else next(
+                (k for k in params if k not in ("action", "os")), "host")
+            method = poc.get("method", "GET")
             t0 = time.time()
-            handle.request(poc["route"], {"host": "127.0.0.1"}, method="GET")
+            handle.request(poc["route"], {key: "127.0.0.1"}, method=method)
             base_t = time.time() - t0
             t1 = time.time()
-            handle.request(poc["route"], {"host": "127.0.0.1;sleep 3"}, method="GET")
+            handle.request(poc["route"], {key: "127.0.0.1;sleep 3"}, method=method)
             delay_t = time.time() - t1
             if delay_t - base_t >= 2.5:
                 return True, f"时序盲注成立：注入请求耗时 {delay_t:.1f}s（基线 {base_t:.1f}s）"
@@ -330,10 +410,28 @@ def verify(vuln: dict, workspace: str, handle) -> tuple[bool, str]:
         return False, f"请求失败: {type(e).__name__}"
 
 
+def _poc_priority(item, workspace: str):
+    """POC 候选排序：可映射规则 > 能提取 route > 严重性 > CodeQL 来源"""
+    row, v = item
+    rule = str(v.get("rule_id", "")).lower()
+    supported = any(k in rule for k in (
+        "sql-injection", "command-injection", "command-line-injection", "tainted-exec", "path-traversal",
+        "file-inclusion", "ssrf", "xss", "echoed-request", "deserialization",
+        "pickle", "template", "ssti", "render-template", "eval-exec",
+        "code-injection", "code-execution", "tainted-callable", "call_user_func",
+    ))
+    route = extract_route(workspace, v.get("file_path", ""), v.get("line", 0)) if workspace else None
+    sev = {"ERROR": 0, "HIGH": 0, "WARNING": 1, "MEDIUM": 1, "INFO": 2, "LOW": 2}.get(
+        str(v.get("severity", "")).upper(), 3)
+    source = 0 if v.get("source") == "codeql" else 1
+    return (0 if supported else 1, 0 if route and route != "/" else 1, sev, source)
+
+
 def verify_all(vuln_rows: list[tuple], workspace: str, handle, max_n: int = 8) -> int:
-    """批量验证，就地写入 row.poc_* 字段，返回验证通过条数"""
+    """批量验证，按可验证性排序后就地写入 row.poc_* 字段，返回验证通过条数"""
     passed = 0
-    for row, v in vuln_rows[:max_n]:
+    ordered = sorted(vuln_rows, key=lambda item: _poc_priority(item, workspace))[:max_n]
+    for row, v in ordered:
         try:
             ok, result = verify(v, workspace, handle)
             poc = build_poc(v, workspace)

@@ -1,0 +1,3 @@
+# ISeeCode 沙箱 egress 追加白名单（每行一个域名，支持子域匹配）
+# 默认已包含 pypi/npm/maven/Go/GitHub 域名族；新 CDN 或自定义仓库写在这里。
+# 例：downloads.example.org

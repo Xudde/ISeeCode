@@ -1,0 +1,134 @@
+{% extends "base.html" %}
+{% set nav = 'intel' %}
+{% block title %}情报闭环 · 源码自动化审计平台{% endblock %}
+{% block content %}
+
+<div class="page-head">
+  <div>
+    <div class="page-title">情报闭环</div>
+    <div class="page-sub">watchlist → OSV 增量 → 事件库 → Webhook（Webhook 在“平台设置”里配置）</div>
+  </div>
+  <div class="head-actions">
+    <button class="btn btn-primary" id="btn-run-intel">立即运行</button>
+  </div>
+</div>
+
+<div class="form-row">
+  <div class="card">
+    <div class="card-title">Watchlist <span class="hint">按包名/生态监控 OSV 新漏洞</span></div>
+    <label class="f-label"><b>包名</b> target</label>
+    <input type="text" id="w-target" placeholder="flask / lodash / golang.org/x/net">
+    <label class="f-label"><b>生态</b> ecosystem</label>
+    <select id="w-eco" class="mini">
+      <option>PyPI</option><option>npm</option><option>Go</option>
+      <option>Maven</option><option>RubyGems</option><option>Packagist</option>
+    </select>
+    <label class="f-label"><b>仓库</b> repo（owner/repo，可选，用于自动建任务）</label>
+    <input type="text" id="w-repo" placeholder="pallets/flask">
+    <label class="f-label"><input type="checkbox" id="w-auto"> 命中后自动下载最新 release 建 poc 任务</label>
+    <label class="f-label"><input type="checkbox" id="w-notify" checked> Webhook 通知</label>
+    <div style="margin-top:14px">
+      <button class="btn btn-primary" id="btn-add-watch">加入 watchlist</button>
+    </div>
+    <div class="tbl-wrap" style="margin-top:14px;max-height:300px;overflow:auto">
+      <table class="tbl">
+        <thead><tr><th>包</th><th>生态</th><th>仓库</th><th>自动</th><th></th></tr></thead>
+        <tbody id="w-body"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">最近情报事件 <span class="hint">OSV 新漏洞</span></div>
+    <div class="tbl-wrap" style="max-height:520px;overflow:auto">
+      <table class="tbl">
+        <thead><tr><th style="width:120px">CVE</th><th>包 / 摘要</th><th style="width:80px">等级</th><th style="width:70px">任务</th></tr></thead>
+        <tbody id="e-body"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function loadWatchlist() {
+  try {
+    const d = await SAP.api('/api/intel/watchlist');
+    document.getElementById('w-body').innerHTML = (d.items || []).map(w => `
+      <tr>
+        <td><code>${SAP.esc(w.target)}</code></td>
+        <td>${SAP.esc(w.ecosystem)}</td>
+        <td class="muted" style="font-size:11px">${SAP.esc(w.repo || '—')}</td>
+        <td>${w.auto_scan ? '是' : '否'}</td>
+        <td><button class="btn btn-sm" data-del="${w.id}">删除</button></td>
+      </tr>`).join('') || '<tr><td colspan="5"><div class="empty">watchlist 为空</div></td></tr>';
+  } catch (e) { SAP.toast('读取 watchlist 失败：' + e.message, 'err'); }
+}
+
+async function loadEvents() {
+  try {
+    const d = await SAP.api('/api/intel/events?limit=50');
+    document.getElementById('e-body').innerHTML = (d.items || []).map(x => `
+      <tr>
+        <td><code>${SAP.esc(x.cve || x.advisory_id)}</code></td>
+        <td>
+          <div><b>${SAP.esc(x.package)}</b> <span class="muted">${SAP.esc(x.ecosystem)}</span></div>
+          <div class="muted" style="font-size:11px;max-width:560px;white-space:normal">${SAP.esc((x.summary || '').slice(0, 160))}</div>
+        </td>
+        <td><span class="pill ${x.severity === 'HIGH' || x.severity === 'CRITICAL' ? 'fp' : 'na'}">${SAP.esc(x.severity || '—')}</span></td>
+        <td>${x.task_id ? `<a href="/tasks/${x.task_id}">#${x.task_id}</a>` : '—'}</td>
+      </tr>`).join('') || '<tr><td colspan="4"><div class="empty">还没有情报事件</div></td></tr>';
+  } catch (e) { SAP.toast('读取情报事件失败：' + e.message, 'err'); }
+}
+
+document.getElementById('btn-add-watch').addEventListener('click', async () => {
+  const target = document.getElementById('w-target').value.trim();
+  const eco = document.getElementById('w-eco').value;
+  if (!target) { SAP.toast('包名不能为空', 'err'); return; }
+  try {
+    await SAP.api('/api/intel/watchlist', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        target, ecosystem: eco,
+        repo: document.getElementById('w-repo').value.trim(),
+        auto_scan: document.getElementById('w-auto').checked,
+        notify: document.getElementById('w-notify').checked
+      })
+    });
+    SAP.toast('已加入 watchlist', 'ok');
+    document.getElementById('w-target').value = '';
+    document.getElementById('w-repo').value = '';
+    await loadWatchlist();
+  } catch (e) { SAP.toast('加入失败：' + e.message, 'err'); }
+});
+
+document.getElementById('btn-run-intel').addEventListener('click', async () => {
+  const btn = document.getElementById('btn-run-intel');
+  btn.disabled = true; btn.textContent = '运行中…';
+  try {
+    const r = await SAP.api('/api/intel/run', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ auto_task: false })
+    });
+    SAP.toast(`完成：新增 ${r.new_events} 条事件`, 'ok');
+    await loadEvents();
+  } catch (e) { SAP.toast('运行失败：' + e.message, 'err'); }
+  finally { btn.disabled = false; btn.textContent = '立即运行'; }
+});
+
+document.getElementById('w-body').addEventListener('click', async e => {
+  const btn = e.target.closest('[data-del]');
+  if (!btn) return;
+  if (!confirm('从 watchlist 删除？')) return;
+  try {
+    await SAP.api('/api/intel/watchlist/' + btn.dataset.del, { method: 'DELETE' });
+    await loadWatchlist();
+  } catch (err) { SAP.toast('删除失败：' + err.message, 'err'); }
+});
+
+loadWatchlist();
+loadEvents();
+</script>
+{% endblock %}

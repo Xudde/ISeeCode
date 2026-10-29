@@ -1,0 +1,114 @@
+{% extends "base.html" %}
+{% set nav = 'dashboard' %}
+{% block title %}总览仪表盘 · 源码自动化审计平台{% endblock %}
+{% block content %}
+
+<div class="page-head">
+  <div>
+    <div class="page-title">总览仪表盘</div>
+    <div class="page-sub">跨任务统计：三引擎贡献、严重性分布与最近审计一览</div>
+  </div>
+  <div class="head-actions">
+    <button class="btn" id="btn-refresh">刷新数据</button>
+  </div>
+</div>
+
+<div class="stats" id="stats-tasks"></div>
+
+<div class="form-row">
+  <div class="card">
+    <div class="card-title">漏洞来源分布 <span class="hint">谁挖出来的</span></div>
+    <div id="chart-source"></div>
+  </div>
+  <div class="card">
+    <div class="card-title">严重性分布 <span class="hint">所有命中</span></div>
+    <div id="chart-sev"></div>
+  </div>
+</div>
+
+<div class="card" style="padding:0;overflow:hidden">
+  <div class="card-title" style="padding:14px 18px;margin:0">最近审计任务</div>
+  <div class="tbl-wrap" style="border:none;border-radius:0">
+    <table class="tbl">
+      <thead><tr><th style="width:60px">ID</th><th>文件名</th><th style="width:120px">状态</th><th style="width:200px">技术栈</th><th style="width:90px">漏洞</th><th style="width:170px">时间</th></tr></thead>
+      <tbody id="recent-body"></tbody>
+    </table>
+  </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+const SOURCE_CN = {
+  semgrep: '平台规则 (semgrep)',
+  giants: '授权/配置规则包',
+  'giants:gitleaks': 'gitleaks 密钥',
+  'giants:trivy': 'trivy 配置基线',
+  'giants:trivy-secret': 'trivy 密钥',
+  'agent-full': 'Agent 全量审计',
+  apk: 'APK 分析',
+  image: '镜像基线',
+  authz: '未授权接口候选',
+  codeql: 'CodeQL',
+  'giants:self-cve': '自版本 CVE'
+};
+const SEV_ORDER = ['ERROR', 'HIGH', 'WARNING', 'MEDIUM', 'INFO', 'LOW', 'CRITICAL'];
+const SEV_COLOR = {ERROR: 'var(--red)', CRITICAL: 'var(--red)', HIGH: 'var(--orange)',
+                   WARNING: 'var(--amber)', MEDIUM: 'var(--amber)', INFO: 'var(--blue)', LOW: 'var(--text-faint)'};
+
+function bars(container, items, colorFn) {
+  const max = Math.max(...items.map(i => i.n), 1);
+  container.innerHTML = items.map(i => `
+    <div style="margin-bottom:10px">
+      <div style="display:flex;justify-content:space-between;font-size:12.5px;margin-bottom:3px">
+        <span>${SAP.esc(i.label)}</span>
+        <b style="font-family:var(--mono)">${i.n}</b>
+      </div>
+      <div style="height:9px;border-radius:5px;background:var(--panel-3);overflow:hidden">
+        <i style="display:block;height:100%;width:${Math.max(i.n / max * 100, 2)}%;border-radius:5px;background:${colorFn(i)}"></i>
+      </div>
+    </div>`).join('') || '<div class="empty">暂无数据</div>';
+}
+
+function render(d) {
+  const t = d.tasks, v = d.vulns;
+  document.getElementById('stats-tasks').innerHTML = `
+    <div class="stat s-info"><div class="num">${t.total}</div><div class="lbl">审计任务总数</div></div>
+    <div class="stat s-warn"><div class="num">${t.active}</div><div class="lbl">进行中 / 排队</div></div>
+    <div class="stat s-ok"><div class="num">${t.completed}</div><div class="lbl">已完成</div></div>
+    <div class="stat"><div class="num">${v.total}</div><div class="lbl">漏洞命中总数</div></div>
+    <div class="stat s-ok"><div class="num">${v.verified}</div><div class="lbl">AI/Agent 验真</div></div>
+    <div class="stat s-bad"><div class="num">${v.false_positive}</div><div class="lbl">AI/Agent 误报</div></div>
+    <div class="stat s-warn"><div class="num">${v.unjudged}</div><div class="lbl">未研判</div></div>
+    <div class="stat s-ok"><div class="num">${v.poc_verified}</div><div class="lbl">POC 动态复现</div></div>`;
+
+  bars(document.getElementById('chart-source'),
+    Object.entries(d.by_source).sort((a, b) => b[1] - a[1])
+      .map(([k, n]) => ({label: SOURCE_CN[k] || k, n})),
+    () => 'linear-gradient(90deg, var(--accent-dim), var(--accent))');
+
+  bars(document.getElementById('chart-sev'),
+    SEV_ORDER.filter(s => d.by_severity[s]).map(s => ({label: s, n: d.by_severity[s]})),
+    i => SEV_COLOR[i.label] || 'var(--text-faint)');
+
+  const body = document.getElementById('recent-body');
+  body.innerHTML = d.recent.map(t => `
+    <tr onclick="location.href='/tasks/${t.id}'" style="cursor:pointer">
+      <td class="tid">#${t.id}</td>
+      <td><div class="fname" title="${SAP.esc(t.filename)}">${SAP.esc(t.filename)}</div></td>
+      <td>${SAP.statusPill(t.status)}</td>
+      <td>${SAP.stackTags(t.tech_stack)}</td>
+      <td style="font-family:var(--mono);font-weight:700">${t.vuln_count}</td>
+      <td class="muted" style="font-size:12px">${SAP.fmtTime(t.created_at)}</td>
+    </tr>`).join('') || '<tr><td colspan="6"><div class="empty">还没有审计任务——去任务列表上传第一个项目吧</div></td></tr>';
+}
+
+async function refresh() {
+  try { render(await SAP.api('/api/tasks/stats')); }
+  catch (e) { /* 保留上次数据 */ }
+}
+document.getElementById('btn-refresh').addEventListener('click', refresh);
+refresh();
+</script>
+{% endblock %}

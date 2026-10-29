@@ -13,7 +13,7 @@ from app.config import (AGENT_CONCURRENCY, AGENT_TOKEN_BUDGET,
 from app.agent import react, tools as agent_tools
 from app.agent_settings import AGENT_SETTING_DEFAULTS
 from app.db import SessionLocal
-from app.models import Vulnerability
+from app.models import Task, Vulnerability
 from app.skills.poc import normalize_payload
 
 log = logging.getLogger("agent.orchestrator")
@@ -175,7 +175,7 @@ def full_audit(db: Session, task_id: int, workspace: str, tech_stack: str,
         seen.add((fp, int(ln or 0)))
         if str(rid).startswith("agent-discovered"):
             seen.add((fp, int(ln or 0), rid))
-    found, skipped, error = 0, 0, 0
+    found, skipped, error, upgraded = 0, 0, 0, 0
 
     rounds = st["full_audit_rounds"]
     for rnd in range(1, rounds + 1):
@@ -206,10 +206,29 @@ def full_audit(db: Session, task_id: int, workspace: str, tech_stack: str,
             except (TypeError, ValueError):
                 ln = 0
             key = (fp, ln)
-            if key in seen:
-                skipped += 1
-                continue
-            if key + (f.get("rule_id", ""),) in seen:
+            if key in seen or key + (f.get("rule_id", ""),) in seen:
+                # 已有扫描行被全量审计动态证实：升级为 verified，而不是直接丢弃
+                if str(f.get("verdict") or "verified") == "verified":
+                    try:
+                        row = db.query(Vulnerability).filter(
+                            Vulnerability.task_id == task_id,
+                            Vulnerability.file_path == fp,
+                            Vulnerability.line == ln).order_by(Vulnerability.id).first()
+                        if row is not None and row.agent_status != "verified":
+                            row.agent_status = "verified"
+                            row.agent_confidence = str(f.get("confidence", "medium"))[:8]
+                            row.agent_reason = str(f.get("reason", ""))[:1000]
+                            row.precondition = str(f.get("precondition", ""))[:512]
+                            row.poc_payload = normalize_payload(str(f.get("payload", "")))[:500]
+                            row.agent_evidence = (f"[exploitability={f.get('exploitability', 'none')}] "
+                                                  f"{f.get('evidence', '')}")[:4000]
+                            row.verify_result = f"Agent 全量审计: {str(f.get('evidence', ''))[:200]}"
+                            row.poc_verified = True
+                            row.analyzed_at = datetime.now()
+                            upgraded += 1
+                    except Exception as e:
+                        error += 1
+                        log_fn(f"全量审计升级已有漏洞失败: {e}")
                 skipped += 1
                 continue
             seen.add(key)
@@ -241,4 +260,4 @@ def full_audit(db: Session, task_id: int, workspace: str, tech_stack: str,
                 error += 1
                 log_fn(f"全量审计落库失败: {e}")
         db.commit()
-    return {"found": found, "skipped": skipped, "error": error}
+    return {"found": found, "skipped": skipped, "error": error, "upgraded": upgraded}

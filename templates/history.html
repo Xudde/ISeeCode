@@ -1,0 +1,104 @@
+{% extends "base.html" %}
+{% set nav = 'history' %}
+{% block title %}历史审计 · 源码自动化审计平台{% endblock %}
+{% block content %}
+
+<div class="page-head">
+  <div>
+    <div class="page-title">历史审计</div>
+    <div class="page-sub">按文件 SHA-256 聚合；同一文件平台上传会自动去重，这里避免重复审计同一版本</div>
+  </div>
+  <div class="head-actions">
+    <input type="text" id="history-search" placeholder="搜索文件名 / 技术栈…" style="min-width:240px">
+    <button class="btn btn-primary" id="btn-export-packs">批量导出深挖包</button>
+    <button class="btn" id="btn-refresh-history">刷新</button>
+  </div>
+</div>
+
+<div class="card" style="padding:0;overflow:hidden">
+  <div class="tbl-wrap" style="border:none;border-radius:0">
+    <table class="tbl">
+      <thead><tr>
+        <th style="width:40px"><input type="checkbox" id="history-all"></th>
+        <th style="width:80px">最近任务</th><th>项目文件</th><th style="width:160px">类型 / 技术栈</th>
+        <th style="width:150px">首次审计</th><th style="width:150px">最近审计</th>
+        <th style="width:80px">次数</th><th style="width:90px">命中</th><th style="width:100px">状态</th>
+        <th style="width:90px">操作</th>
+      </tr></thead>
+      <tbody id="history-body"></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="muted" id="history-summary" style="margin-top:10px;font-size:12px"></div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+let historyItems = [];
+
+function renderHistory() {
+  const q = (document.getElementById('history-search').value || '').toLowerCase().trim();
+  const items = historyItems.filter(x =>
+    !q || String(x.filename).toLowerCase().includes(q) ||
+    String(x.tech_stack).toLowerCase().includes(q) ||
+    String(x.project_type).toLowerCase().includes(q));
+  const body = document.getElementById('history-body');
+  body.innerHTML = items.map(x => `
+    <tr>
+      <td><input type="checkbox" class="history-cb" value="${x.latest_id}"></td>
+      <td class="tid"><a href="/tasks/${x.latest_id}">#${x.latest_id}</a></td>
+      <td><div class="fname" title="${SAP.esc(x.filename)}">${SAP.esc(x.filename)}</div>
+          <div class="muted" style="font-size:11px">SHA-256: ${SAP.esc(String(x.key).slice(0, 20))}…</div></td>
+      <td>${SAP.esc(x.project_type || '')}${x.tech_stack ? '<br><span class="muted" style="font-size:11px">' + SAP.esc(x.tech_stack) + '</span>' : ''}</td>
+      <td class="muted" style="font-size:12px">${SAP.fmtTime(x.first_at)}</td>
+      <td class="muted" style="font-size:12px">${SAP.fmtTime(x.last_at)}</td>
+      <td style="font-family:var(--mono)">${x.runs}</td>
+      <td style="font-family:var(--mono);font-weight:700">${x.vuln_count}</td>
+      <td>${SAP.statusPill(x.latest_status)}</td>
+      <td><span class="pill ${x.deep_status === 'completed' ? 'ok' : (x.deep_status === 'running' ? 'na' : 'dash')}">${SAP.esc(x.deep_status || 'pending')}</span></td>
+      <td><a class="btn btn-sm" href="/tasks/${x.latest_id}">查看</a></td>
+    </tr>`).join('') || '<tr><td colspan="11"><div class="empty">没有匹配的历史审计项目</div></td></tr>';
+  document.getElementById('history-summary').textContent =
+    `共 ${items.length} 个唯一文件（任务次数按 SHA-256 聚合）`;
+}
+
+async function loadHistory() {
+  try {
+    const d = await SAP.api('/api/tasks/history');
+    historyItems = d.items || [];
+    renderHistory();
+  } catch (e) { SAP.toast('读取历史失败：' + e.message, 'err'); }
+}
+document.getElementById('history-all').addEventListener('change', (e) => {
+  document.querySelectorAll('.history-cb').forEach(cb => cb.checked = e.target.checked);
+});
+document.getElementById('btn-export-packs').addEventListener('click', async () => {
+  const ids = [...document.querySelectorAll('.history-cb:checked')].map(x => Number(x.value));
+  if (!ids.length) { SAP.toast('先勾选要导出的项目', 'err'); return; }
+  const btn = document.getElementById('btn-export-packs');
+  btn.disabled = true; btn.textContent = '打包中…';
+  try {
+    const resp = await fetch('/api/tasks/agent-packs', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ task_ids: ids })
+    });
+    if (!resp.ok) {
+      let d = {}; try { d = await resp.json(); } catch (e) {}
+      throw new Error(d.detail || `HTTP ${resp.status}`);
+    }
+    const blob = await resp.blob();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `agent_packs_${ids.length}tasks.zip`;
+    a.click(); URL.revokeObjectURL(a.href);
+    SAP.toast(`已导出 ${ids.length} 个深挖包`, 'ok');
+  } catch (e) { SAP.toast('导出失败：' + e.message, 'err'); }
+  finally { btn.disabled = false; btn.textContent = '批量导出深挖包'; }
+});
+document.getElementById('history-search').addEventListener('input', renderHistory);
+document.getElementById('btn-refresh-history').addEventListener('click', loadHistory);
+loadHistory();
+</script>
+{% endblock %}

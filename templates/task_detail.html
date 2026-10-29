@@ -4,6 +4,23 @@
 {% block content %}
 {% if task %}
 
+<style>
+.chain-item{margin:8px 0 16px;min-width:0}
+.chain-title{font-weight:600;margin-bottom:8px;font-size:13px}
+.chain-flow{display:flex;flex-wrap:nowrap;gap:6px;align-items:stretch;overflow-x:auto;
+  padding-bottom:8px;scrollbar-width:thin;scrollbar-color:rgba(128,150,180,.5) transparent}
+.chain-flow::-webkit-scrollbar{height:8px}
+.chain-flow::-webkit-scrollbar-thumb{background:rgba(128,150,180,.45);border-radius:4px}
+.chain-node{flex:0 0 180px;min-width:180px;max-width:180px;
+  border:1px solid rgba(128,150,180,.35);border-radius:8px;padding:8px 10px;
+  background:rgba(128,150,180,.07)}
+.chain-node .cn-type{font-size:10px;text-transform:uppercase;letter-spacing:.08em;opacity:.6}
+.chain-node .cn-label{font-size:12.5px;margin:2px 0;word-break:break-word}
+.chain-node .cn-loc{font-family:var(--mono,monospace);font-size:10.5px;opacity:.65;word-break:break-all}
+.chain-node details{font-size:11px;opacity:.85;margin-top:4px;max-height:160px;overflow:auto}
+.chain-arrow{align-self:center;opacity:.5;font-size:16px;flex:0 0 auto}
+</style>
+
 <div class="page-head">
   <div>
     <div class="page-title">
@@ -23,6 +40,56 @@
 </div>
 
 <div class="stats" id="stats"></div>
+<div class="engine-line" id="engine-line"></div>
+
+<!-- ==================== 验证能力与边界 ==================== -->
+<div class="card cap-card" id="cap-card" hidden>
+  <div class="card-title">验证能力与边界 <span class="hint">如实标注：未验证 ≠ 无漏洞，平台不输出假验证</span></div>
+  <div class="cap-list" id="cap-list"></div>
+</div>
+
+<!-- ==================== 人工深挖 Top-N ==================== -->
+<div class="card hot-card" id="hot-card" hidden>
+  <div class="card-title">值得人看的 Top-N 文件
+    <span class="hint">按命中与攻击面排序，供人工 / IDE Agent 深挖</span>
+    <span class="hot-actions">
+      <button class="btn btn-sm" id="hot-copy">复制清单</button>
+      <a class="btn btn-sm" id="hot-dl" href="#">下载 Markdown</a>
+    </span>
+  </div>
+  <div class="hot-list" id="hot-list"></div>
+</div>
+
+<!-- ==================== 利用链 ==================== -->
+<div class="card" id="chain-card" hidden>
+  <div class="card-title">利用链
+    <span class="hint">入口 → 参数 → 传播 → sink → 验证；点节点展开证据</span>
+  </div>
+  <div id="chain-list"></div>
+</div>
+
+<!-- ==================== 鉴权语义 ==================== -->
+<div class="card" id="authz-card" hidden>
+  <div class="card-title">鉴权语义
+    <span class="hint">框架级：匿名 / 条件放行 / 登录 / 角色；先看匿名与条件放行</span>
+  </div>
+  <div class="muted" id="authz-summary" style="margin-bottom:8px;font-size:12px"></div>
+  <div class="tbl-wrap" style="border:none;max-height:340px;overflow:auto">
+    <table class="tbl">
+      <thead><tr>
+        <th style="width:60px">方法</th><th>路径</th><th style="width:110px">标签</th>
+        <th style="width:210px">位置</th><th>依据</th>
+      </tr></thead>
+      <tbody id="authz-body"></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ==================== 轻扫结果 ==================== -->
+<div class="card" id="ffuf-card" hidden>
+  <div class="card-title">ffuf 轻扫 <span class="hint">仅沙箱内路径发现，不生成注入 payload</span></div>
+  <pre class="log" id="ffuf-out" style="max-height:320px"></pre>
+</div>
 
 <!-- ==================== 执行日志 ==================== -->
 <div class="card log-card">
@@ -67,6 +134,7 @@
     </tbody>
   </table>
 </div>
+<div class="pager" id="vuln-pager"></div>
 
 <script>window.__LABELS__ = {{ vuln_labels | tojson }};</script>
 {% else %}
@@ -81,13 +149,38 @@ const TASK_ID = {{ task.id }};
 const FINAL = SAP.FINAL;
 let task = null, vulns = [];
 let filter = 'all', sevFilter = '', search = '';
+const VULN_PAGE_SIZES = [10, 20, 50, 100];
+let vulnPage = 1;
+let vulnPageSize = 20;
+try { vulnPageSize = Number(localStorage.getItem('sap-vuln-page-size')) || 20; } catch (e) {}
+if (!VULN_PAGE_SIZES.includes(vulnPageSize)) vulnPageSize = 20;
 const expanded = new Set();
 let vulnSig = '';
+let cfgMaxFiles = 500;
+let hotlist = null, hotFetched = false;
+
+async function copyText(text) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    try { await navigator.clipboard.writeText(text); return; } catch (e) {}
+  }
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed';
+  ta.style.left = '-9999px';
+  ta.style.top = '0';
+  document.body.appendChild(ta);
+  ta.focus(); ta.select();
+  let ok = false;
+  try { ok = document.execCommand('copy'); } catch (e) {}
+  document.body.removeChild(ta);
+  if (!ok) throw new Error('浏览器禁止复制，请用“下载提示词”');
+}
 
 /* ---------- 头部渲染 ---------- */
 function renderHead() {
   document.getElementById('hd-status').innerHTML = SAP.statusPill(task.status);
-  const mode = task.audit_mode === 'static' ? '仅静态扫描' : '完整审计';
+  const mode = task.audit_mode === 'static' ? '仅静态扫描（未做沙箱/POC）'
+    : task.audit_mode === 'poc' ? '沙箱 POC 验证' : '完整审计';
   document.getElementById('hd-meta').innerHTML =
     `<div class="kv">
       <span>技术栈 ${SAP.stackTags(task.tech_stack)}</span>
@@ -110,10 +203,189 @@ function renderHead() {
     h += `<a class="btn btn-primary" href="/api/tasks/${TASK_ID}/report" target="_blank">下载 HTML 报告</a>`;
     h += `<a class="btn" href="/api/tasks/${TASK_ID}/report?format=md">Markdown</a>`;
     h += `<a class="btn" href="/api/tasks/${TASK_ID}/report?format=json">JSON（AI 版）</a>`;
+    h += `<button class="btn" id="btn-agent-prompt">复制 AI 深挖提示词</button>`;
+    h += `<a class="btn" href="/api/tasks/${TASK_ID}/agent-prompt?download=1">下载提示词</a>`;
+    h += `<a class="btn" href="/api/tasks/${TASK_ID}/authz-inventory?format=md">未授权接口清单</a>`;
+    h += `<a class="btn" href="/api/tasks/${TASK_ID}/authz-semantic?format=md">鉴权语义</a>`;
+    h += `<a class="btn" href="/api/tasks/${TASK_ID}/agent-pack">下载 AI 深挖包</a>`;
+  }
+  if (task.sandbox_cid) {
+    h += `<button class="btn" id="btn-authz-probe">无凭证探测</button>`;
+    h += `<button class="btn" id="btn-authz-write">写操作探测</button>`;
+    h += `<button class="btn" id="btn-ffuf">ffuf 轻扫</button>`;
   }
   h += `<button class="btn btn-danger" id="btn-del">删除任务</button>`;
   document.getElementById('hd-actions').innerHTML = h;
+  const apBtn = document.getElementById('btn-agent-prompt');
+  if (apBtn) apBtn.addEventListener('click', async () => {
+    try {
+      const r = await SAP.api(`/api/tasks/${TASK_ID}/agent-prompt`);
+      await copyText(r.prompt);
+      SAP.toast('提示词已复制，可直接粘贴给 Trae / Qoder / Zcode', 'ok');
+    } catch (e) {
+      SAP.toast('浏览器禁止复制，正在下载提示词…', 'err');
+      window.location.href = `/api/tasks/${TASK_ID}/agent-prompt?download=1`;
+    }
+  });
+  const probeBtn = document.getElementById('btn-authz-probe');
+  const writeBtn = document.getElementById('btn-authz-write');
+  async function downloadAuthzProbe(btn, url, label) {
+    btn.disabled = true; btn.textContent = '探测中…';
+    try {
+      const resp = await fetch(url, { method: 'POST' });
+      if (!resp.ok) {
+        let d = {};
+        try { d = await resp.json(); } catch (e) {}
+        throw new Error(d.detail || `HTTP ${resp.status}`);
+      }
+      const blob = await resp.blob();
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `task_${TASK_ID}_authz_probe${url.includes('allow_write=true') ? '_write' : ''}.json`;
+      a.click();
+      URL.revokeObjectURL(a.href);
+      SAP.toast(label + '结果已下载（只证明可访问性）', 'ok');
+    } catch (e) { SAP.toast('探测失败：' + e.message, 'err'); }
+    finally { btn.disabled = false; btn.textContent = label; }
+  }
+  if (probeBtn) probeBtn.addEventListener('click', () =>
+    downloadAuthzProbe(probeBtn, `/api/tasks/${TASK_ID}/authz-probe?max_n=10`, '无凭证探测'));
+  if (writeBtn) writeBtn.addEventListener('click', () => {
+    if (!confirm('将对候选 POST 接口发送无凭证空请求，仅限已保留沙箱；可能产生测试数据。继续？')) return;
+    downloadAuthzProbe(writeBtn,
+      `/api/tasks/${TASK_ID}/authz-probe?max_n=10&allow_write=true&confirm=YES`, '写操作探测');
+  });
+  const ffufBtn = document.getElementById('btn-ffuf');
+  if (ffufBtn) ffufBtn.addEventListener('click', async () => {
+    const card = document.getElementById('ffuf-card');
+    const out = document.getElementById('ffuf-out');
+    ffufBtn.disabled = true; ffufBtn.textContent = '轻扫中…';
+    card.hidden = false; out.textContent = '正在沙箱内跑固定小字典（仅路径发现）…';
+    try {
+      const r = await SAP.api(`/api/tasks/${TASK_ID}/tool-scan`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tool: 'ffuf', timeout: 60 })
+      });
+      const hits = r.hits || [];
+      out.textContent = hits.length
+        ? hits.map(x => `[${x.status}] ${x.length}B  ${x.url}`).join('\n')
+        : `未发现命中。exit=${r.exit_code}\n${r.output || ''}`;
+      SAP.toast(`ffuf 完成：命中 ${hits.length} 个路径`, hits.length ? 'ok' : 'err');
+    } catch (e) {
+      out.textContent = '轻扫失败：' + e.message;
+      SAP.toast('轻扫失败：' + e.message, 'err');
+    } finally { ffufBtn.disabled = false; ffufBtn.textContent = 'ffuf 轻扫'; }
+  });
 }
+
+/* ---------- 验证能力与边界（诚实标注） ---------- */
+function capLine(cls, title, text) {
+  return `<div class="cap-line ${cls}"><span class="cap-dot"></span><div><b>${title}</b>${text ? '：' + SAP.esc(text) : ''}</div></div>`;
+}
+
+function renderCapabilities() {
+  const card = document.getElementById('cap-card');
+  const list = document.getElementById('cap-list');
+  if (!task) { card.hidden = true; return; }
+  const L = task.log || '';
+  const isStatic = task.audit_mode === 'static';
+  const ptype = task.project_type || 'web';
+  const final = FINAL.includes(task.status);
+  const out = [];
+
+  if (task.audit_mode === 'poc') {
+    out.push(capLine('info', '沙箱 POC 验证模式', '仅部署沙箱并执行命中验证，不调用 LLM/Agent（0 token）；验证通过只代表该 POC 在沙箱内成立。'));
+  }
+  if (ptype === 'driver') {
+    out.push(capLine('info', 'Windows 驱动静态审计', 'PE 结构/导入/签名 + capa 能力识别 + Ghidra 反汇编导出伪 C；不加载驱动，IOCTL 逻辑与 DACL 仍需人工复核。'));
+  } else if (ptype === 'apk') {
+    out.push(capLine('info', 'APK 静态分析', 'Manifest/DEX + MobSF（如已部署：组件/权限/证书/密钥/跟踪器）；不做动态运行，动态验证需真机/模拟器。'));
+  } else if (ptype === 'image') {
+    out.push(capLine('info', '镜像基线任务', '只做 Dockerfile/镜像配置基线检查，无运行时服务，不涉及 POC。'));
+  } else if (ptype === 'decompile') {
+    out.push(capLine('info', '反编译任务', '对反编译产物做静态扫描，不部署沙箱；行号仅供参考。'));
+  } else if (isStatic) {
+    out.push(capLine('info', '仅静态扫描', '未启动 Agent、沙箱与 POC（0 token），POC 列为空属正常。'));
+  } else if (task.sandbox_cid) {
+    out.push(capLine('ok', '沙箱已保留', `可展开带 POC 的条目，在禁网容器内手工重放（容器端口 ${task.sandbox_port || '-'}）。`));
+  } else if (final) {
+    out.push(capLine('warn', '沙箱未部署，POC 未验证', '沙箱默认先查挖矿特征；干净时允许依赖拉取，启动后自动断网。若依赖/构建仍失败或没有可启动入口，会降级为纯静态验证，平台不会伪造成已复现。'));
+  } else {
+    out.push(capLine('info', '沙箱部署策略', '默认先查挖矿特征；干净时允许依赖拉取，启动后断网；PHP/自包含 Python 最可靠，真实 Java/Node 仍可能因构建/数据库依赖失败。'));
+  }
+
+  const decMatch = L.match(/反编译成功 (\d+) 个编译产物/);
+  if (decMatch) {
+    out.push(capLine('ok', '反编译', `成功还原 ${decMatch[1]} 个编译产物，源码已并入扫描目录`));
+  } else if (L.includes('Ghidra 原生反编译产物')) {
+    out.push(capLine('ok', '原生反编译', 'Ghidra 已导出伪 C，供 semgrep/人工继续分析'));
+  } else if (L.includes('降级为字符串特征扫描') || L.includes('ilspycmd 反编译失败')) {
+    out.push(capLine('warn', '反编译降级', '编译产物未能完整还原，已降级为字符串特征扫描（覆盖率有限）'));
+  }
+
+  if (!isStatic && task.audit_mode !== 'poc') {
+    if (L.includes('全量审计已熔断')) {
+      out.push(capLine('warn', '全量审计已熔断', `工作区文件数超过阈值（当前 ${cfgMaxFiles}），本次已跳过并节省 token。可在「平台设置」调整 full_audit_max_files。`));
+    } else if (L.includes('未配置 LLM')) {
+      out.push(capLine('info', 'LLM 未配置', '本次未执行 Agent 研判与全量审计，结果全部来自静态规则与四引擎。'));
+    } else if (L.includes('全量审计完成')) {
+      out.push(capLine('ok', '全量审计已执行', 'Agent 已自主遍历源码，结果标记为「全量审计」并参与报告。'));
+    } else if (task.status === 'agent_full_audit') {
+      out.push(capLine('info', '全量审计进行中', `工作区文件数未超过阈值（当前 ${cfgMaxFiles}），Agent 正在自主遍历源码。`));
+    } else if (final) {
+      out.push(capLine('info', '全量审计未执行', '本次未进入全量审计（可能因任务类型、停止或异常），详见执行日志。'));
+    }
+  }
+
+  list.innerHTML = out.join('');
+  card.hidden = out.length === 0;
+}
+
+/* ---------- 人工深挖 Top-N ---------- */
+function renderHotlist() {
+  const card = document.getElementById('hot-card');
+  const items = (hotlist && hotlist.items) || [];
+  if (!items.length) { card.hidden = true; return; }
+  card.hidden = false;
+  document.getElementById('hot-dl').href = `/api/tasks/${TASK_ID}/hotlist?format=md`;
+  const max = Math.max(...items.map(i => Number(i.score) || 1));
+  document.getElementById('hot-list').innerHTML = items.map(it => {
+    const tags = (it.reasons || []).map(r => `<span class="hot-tag">${SAP.esc(r)}</span>`).join('');
+    const finds = (it.findings || []).slice(0, 4).map(f =>
+      `<span class="hot-find sev-${SAP.esc(String(f.severity || 'info').toLowerCase())}">${SAP.esc(f.severity)} · ${SAP.esc(f.title || f.rule_id)}${f.line ? ' :' + f.line : ''}</span>`).join('');
+    const h = Math.max(6, Math.round((Number(it.score) || 0) / max * 100));
+    return `<div class="hot-item">
+      <div class="hot-rank">${it.rank}</div>
+      <div class="hot-main">
+        <div class="hot-path" title="${SAP.esc(it.file_path)}">${SAP.esc(it.file_path)}</div>
+        <div class="hot-reasons">${tags}</div>
+        ${finds ? `<div class="hot-finds">${finds}</div>` : ''}
+        <div class="hot-focus">建议：${SAP.esc(it.focus || '')}</div>
+      </div>
+      <div class="hot-score" title="综合优先级"><div class="hot-bar"><i style="height:${h}%"></i></div><span>${Number(it.score).toFixed(1)}</span></div>
+    </div>`;
+  }).join('');
+}
+
+async function loadHotlist() {
+  if (hotFetched) return;
+  hotFetched = true;
+  try {
+    hotlist = await SAP.api(`/api/tasks/${TASK_ID}/hotlist`);
+    renderHotlist();
+  } catch (e) { hotFetched = false; }
+}
+
+document.getElementById('hot-copy').addEventListener('click', async () => {
+  try {
+    const resp = await fetch(`/api/tasks/${TASK_ID}/hotlist?format=md`);
+    const ctype = resp.headers.get('content-type') || '';
+    if (!resp.ok || !ctype.includes('text/markdown')) throw new Error(`接口异常（HTTP ${resp.status}）`);
+    const md = await resp.text();
+    await copyText(md);
+    SAP.toast('深挖清单已复制，可直接粘贴给 Trae/Qoder', 'ok');
+  } catch (e) { SAP.toast('复制失败：' + e.message, 'err'); }
+});
 
 function renderFingerprint() {
   const card = document.getElementById('fp-card');
@@ -138,6 +410,27 @@ function renderStats() {
     <div class="stat s-dim"><div class="num">${c.fp}</div><div class="lbl">判定误报</div></div>
     <div class="stat s-warn"><div class="num">${c.pending}</div><div class="lbl">未研判 / 未验证</div></div>
     <div class="stat s-ok"><div class="num">${c.poc}</div><div class="lbl">POC 动态复现</div></div>`;
+  const eng = { semgrep: 0, gitleaks: 0, trivy: 0, selfcve: 0, authz: 0, codeql: 0, jsintel: 0, other: 0 };
+  vulns.forEach(v => {
+    const rid = String(v.rule_id || '').toLowerCase();
+    if (rid.indexOf('codeql:') === 0) eng.codeql++;
+    else if (rid.indexOf('gitleaks') >= 0) eng.gitleaks++;
+    else if (rid.indexOf('self-cve') >= 0) eng.selfcve++;
+    else if (rid.indexOf('authz:') === 0) eng.authz++;
+    else if (rid.indexOf('trivy') >= 0) eng.trivy++;
+    else if (rid.indexOf('js-intel') >= 0) eng.jsintel++;
+    else if (rid.indexOf('giants:') === 0) eng.other++;
+    else eng.semgrep++;
+  });
+  document.getElementById('engine-line').innerHTML =
+    `<span>引擎命中</span><b title="本地/官方规则">semgrep ${eng.semgrep}</b>` +
+    `<b title="需要密钥特征">gitleaks ${eng.gitleaks}</b>` +
+    `<b title="需要 package-lock/requirements 等依赖清单；无清单时为 0">trivy ${eng.trivy}</b>` +
+    `<b title="项目自身版本 CVE（OSV），只发送包名和版本号，不上传源码">自版本CVE ${eng.selfcve}</b>` +
+    `<b title="未发现鉴权标记的接口候选（静态），需无凭证/沙箱验证">未授权 ${eng.authz}</b>` +
+    `<b title="文件数超限/语言不支持/建库超时会为 0，详见日志">CodeQL ${eng.codeql}</b>` +
+    `<b title="端点/sourcemap 情报">JS情报 ${eng.jsintel}</b>` +
+    `<b title="其他巨人规则">其他巨人 ${eng.other}</b>`;
   document.getElementById('n-all').textContent = n;
   document.getElementById('n-real').textContent = c.real;
   document.getElementById('n-fp').textContent = c.fp;
@@ -161,8 +454,9 @@ function renderLog() {
     if (document.getElementById('log-follow').checked) pre.scrollTop = pre.scrollHeight;
   }
 }
-document.getElementById('log-copy').addEventListener('click', () => {
-  navigator.clipboard.writeText(task.log || '').then(() => SAP.toast('日志已复制', 'ok'));
+document.getElementById('log-copy').addEventListener('click', async () => {
+  try { await copyText(task.log || ''); SAP.toast('日志已复制', 'ok'); }
+  catch (e) { SAP.toast('复制失败：' + e.message, 'err'); }
 });
 
 /* ---------- 漏洞表 ---------- */
@@ -180,20 +474,28 @@ function codeBlock(v) {
 }
 
 function pocBlock(v) {
-  if (!v.poc_payload) return '';
-  let h = `<h4>POC Payload</h4><div class="poc-line">${SAP.esc(v.poc_payload)}</div>`;
-  if (task.status === 'completed') {
-    h += `<div class="poc-box">
-      <textarea rows="2" id="pta-${v.id}">${SAP.esc(v.poc_payload)}</textarea>
-      <div style="display:flex;gap:8px;align-items:center">
+  if (task.status !== 'completed' || (!v.poc_payload && !task.sandbox_cid)) return '';
+  let h = '';
+  if (v.poc_payload) {
+    h += `<h4>POC Payload</h4><div class="poc-line">${SAP.esc(v.poc_payload)}</div>`;
+  }
+  h += `<div class="poc-box">
+      <textarea rows="2" id="pta-${v.id}" placeholder="粘贴 POC payload，例如 GET /?fn=system&arg=id">${SAP.esc(v.poc_payload || '')}</textarea>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
         <button class="btn btn-sm btn-primary poc-run" data-vuln="${v.id}">在沙箱内执行</button>
-        <a class="btn btn-sm" href="/api/tasks/${TASK_ID}/poc-script/${v.id}">下载 POC 脚本</a>
-        <span class="muted" style="font-size:11.5px">在保留的禁网沙箱容器内重放，返回状态码与回显</span>
+        ${v.poc_payload ? `<a class="btn btn-sm" href="/api/tasks/${TASK_ID}/poc-script/${v.id}">下载 POC 脚本</a>` : ''}
+        <span class="muted" style="font-size:11.5px">仅在保留的禁网沙箱容器内执行；手工结果不自动写回研判结论</span>
       </div>
       <pre class="code poc-result" id="pocr-${v.id}" hidden></pre>
     </div>`;
-  }
   return h;
+}
+
+function onVulnPage(page, size) {
+  vulnPage = page;
+  vulnPageSize = size;
+  try { localStorage.setItem('sap-vuln-page-size', String(size)); } catch (e) {}
+  renderVulns(true);
 }
 
 function renderVulns(force) {
@@ -214,11 +516,17 @@ function renderVulns(force) {
   });
 
   const body = document.getElementById('vuln-body');
+  const pager = document.getElementById('vuln-pager');
   if (!list.length) {
     body.innerHTML = `<tr><td colspan="6"><div class="empty">${vulns.length ? '没有符合筛选条件的漏洞' : '暂无漏洞数据'}</div></td></tr>`;
+    vulnPage = SAP.renderPager(pager, 0, vulnPage, vulnPageSize, VULN_PAGE_SIZES, onVulnPage);
     return;
   }
-  body.innerHTML = list.map(v => {
+  const pages = Math.max(1, Math.ceil(list.length / vulnPageSize));
+  if (vulnPage > pages) vulnPage = pages;
+  const start = (vulnPage - 1) * vulnPageSize;
+  const pageList = list.slice(start, start + vulnPageSize);
+  body.innerHTML = pageList.map(v => {
     const vd = SAP.verdict(v);
     const label = v.title || (window.__LABELS__ && window.__LABELS__[v.id]) || v.rule_id.split('.').pop();
     const open = expanded.has(v.id);
@@ -241,6 +549,7 @@ function renderVulns(force) {
         ${v.verify_result ? `<h4>验证结果</h4><div class="ev-text">${SAP.esc(v.verify_result)}</div>` : ''}
       </div></td></tr>` : ''}`;
   }).join('');
+  vulnPage = SAP.renderPager(pager, list.length, vulnPage, vulnPageSize, VULN_PAGE_SIZES, onVulnPage);
 }
 
 /* ---------- 筛选交互 ---------- */
@@ -248,10 +557,15 @@ document.querySelectorAll('.fchip').forEach(b => b.addEventListener('click', () 
   document.querySelectorAll('.fchip').forEach(x => x.classList.remove('active'));
   b.classList.add('active');
   filter = b.dataset.f;
+  vulnPage = 1;
   renderVulns(true);
 }));
-document.getElementById('f-sev').addEventListener('change', e => { sevFilter = e.target.value; renderVulns(true); });
-document.getElementById('f-search').addEventListener('input', e => { search = e.target.value; renderVulns(true); });
+document.getElementById('f-sev').addEventListener('change', e => {
+  sevFilter = e.target.value; vulnPage = 1; renderVulns(true);
+});
+document.getElementById('f-search').addEventListener('input', e => {
+  search = e.target.value; vulnPage = 1; renderVulns(true);
+});
 
 /* 行展开 / 收起（委托） */
 document.getElementById('vuln-body').addEventListener('click', e => {
@@ -303,17 +617,86 @@ document.getElementById('hd-actions').addEventListener('click', async e => {
   } catch (err) { SAP.toast('操作失败：' + err.message, 'err'); }
 });
 
+/* ---------- 利用链节点图 ---------- */
+async function loadChains() {
+  const card = document.getElementById('chain-card');
+  if (!card) return;
+  try {
+    const items = await SAP.api(`/api/tasks/${TASK_ID}/chains`);
+    if (!items || !items.length) { card.hidden = true; return; }
+    card.hidden = false;
+    document.getElementById('chain-list').innerHTML = items.map(c => {
+      const nodes = (c.nodes || []).map(n => `
+        <div class="chain-node">
+          <div class="cn-type">${SAP.esc(n.type || '')}</div>
+          <div class="cn-label">${SAP.esc(n.label || n.id || '')}</div>
+          <div class="cn-loc">${SAP.esc(n.file || '')}${n.line ? ':' + n.line : ''}</div>
+          ${(n.code || n.evidence) ? `<details><summary>证据</summary>${n.code ? `<div>${SAP.esc(n.code)}</div>` : ''}${n.evidence ? `<div>${SAP.esc(n.evidence)}</div>` : ''}</details>` : ''}
+        </div>`).join('<div class="chain-arrow">→</div>');
+      return `<div class="chain-item"><div class="chain-title">${c.verified ? '✅' : '⚠️'} ${SAP.esc(c.title)}
+        <button class="btn btn-sm chain-verify" data-chain="${c.id}">${c.verified ? '重新验证' : '验证'}</button>
+      </div><div class="chain-flow">${nodes}</div></div>`;
+    }).join('');
+  } catch (e) { card.hidden = true; }
+}
+
+document.getElementById('chain-list').addEventListener('click', async e => {
+  const btn = e.target.closest('.chain-verify');
+  if (!btn) return;
+  btn.disabled = true; btn.textContent = '验证中…';
+  try {
+    const r = await SAP.api(`/api/tasks/${TASK_ID}/chains/${btn.dataset.chain}/verify`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}'
+    });
+    SAP.toast(r.verified ? '链验证成功，已写入动态复现库' : '验证未通过：HTTP ' + r.status, r.verified ? 'ok' : 'err');
+    await loadChains();
+    vulns = await SAP.api(`/api/tasks/${TASK_ID}/vulns`);
+    renderVulns();
+  } catch (err) { SAP.toast('验证失败：' + err.message, 'err'); }
+  finally { btn.disabled = false; btn.textContent = '验证'; }
+});
+async function loadAuthzSemantic() {
+  const card = document.getElementById('authz-card');
+  if (!card) return;
+  try {
+    const d = await SAP.api(`/api/tasks/${TASK_ID}/authz-semantic`);
+    const sum = d.summary || {};
+    if (!sum.endpoints) { card.hidden = true; return; }
+    card.hidden = false;
+    const labels = sum.by_label || {};
+    document.getElementById('authz-summary').textContent =
+      `接口 ${sum.endpoints} ｜ ` + Object.entries(labels).map(([k, v]) => `${k}:${v}`).join(' ｜ ');
+    const rows = (d.items || []).filter(x => x.labels === 'anonymous' || x.labels === 'conditional')
+      .slice(0, 40);
+    document.getElementById('authz-body').innerHTML = rows.map(x => `
+      <tr>
+        <td class="tid">${SAP.esc(x.method)}</td>
+        <td><code>${SAP.esc(x.path)}</code></td>
+        <td><span class="pill ${x.labels === 'anonymous' ? 'fp' : 'na'}">${SAP.esc(x.labels)}</span></td>
+        <td><code>${SAP.esc(x.evidence_file)}:${x.evidence_line}</code></td>
+        <td style="font-size:11px">${SAP.esc(x.note || '')}</td>
+      </tr>`).join('') || '<tr><td colspan="5"><div class="empty">没有匿名/条件放行接口</div></td></tr>';
+  } catch (e) { card.hidden = true; }
+}
+
 /* ---------- 轮询 ---------- */
 let timer = null;
 async function refresh() {
   try {
     task = await SAP.api(`/api/tasks/${TASK_ID}`);
-    renderHead(); renderFingerprint(); renderLog();
+    renderHead(); renderFingerprint(); renderCapabilities(); renderLog();
+    if (FINAL.includes(task.status)) loadHotlist();
+    loadChains();
+    loadAuthzSemantic();
     vulns = await SAP.api(`/api/tasks/${TASK_ID}/vulns`);
     renderVulns();
     if (FINAL.includes(task.status) && timer) { clearInterval(timer); timer = null; }
   } catch (e) { /* 保留上次数据 */ }
 }
+SAP.api('/api/config').then(c => {
+  cfgMaxFiles = parseInt(c.full_audit_max_files, 10) || 500;
+  renderCapabilities();
+}).catch(() => {});
 refresh();
 if (!FINAL.includes('{{ task.status }}')) timer = setInterval(refresh, 3000);
 </script>

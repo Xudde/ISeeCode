@@ -13,6 +13,16 @@ AGENT_SETTING_DEFAULTS = {
     "full_audit_rounds": 3,               # 全量审计轮次
     "full_audit_token_per_round": 400_000,  # 每轮 token 软上限（估算）
     "full_audit_max_findings": 8,         # 每轮提交漏洞条数上限
+    "full_audit_max_files": 500,          # 工作区文件数超过该值自动跳过全量审计（熔断）
+    "engine_jsintel": 1,                  # 前端 JS 情报
+    "engine_codeql": 1,                   # CodeQL 数据流
+    "engine_gitleaks": 1,                 # gitleaks 密钥
+    "engine_trivy": 1,                    # trivy 配置基线
+    "engine_trivy_cve": 1,                # trivy 依赖 CVE
+    "engine_self_cve": 1,                 # 项目自身版本 CVE（OSV）
+    "engine_authz": 1,                    # 未授权接口清单
+    "codeql_ram_mb": 4096,                # CodeQL 分析内存上限
+    "codeql_threads": 2,                  # CodeQL 分析线程
 }
 
 SETTING_LABELS = {
@@ -23,6 +33,16 @@ SETTING_LABELS = {
     "full_audit_rounds": "全量审计轮次",
     "full_audit_token_per_round": "每轮 token 预算",
     "full_audit_max_findings": "每轮漏洞条数上限",
+    "full_audit_max_files": "全量审计文件数熔断阈值",
+    "engine_jsintel": "前端 JS 情报",
+    "engine_codeql": "CodeQL 数据流",
+    "engine_gitleaks": "gitleaks 密钥",
+    "engine_trivy": "trivy 配置基线",
+    "engine_trivy_cve": "trivy 依赖 CVE",
+    "engine_self_cve": "项目自身版本 CVE（OSV）",
+    "engine_authz": "未授权接口清单",
+    "codeql_ram_mb": "CodeQL 内存上限（MB）",
+    "codeql_threads": "CodeQL 线程数",
 }
 
 

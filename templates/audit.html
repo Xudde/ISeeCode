@@ -1,0 +1,126 @@
+{% extends "base.html" %}
+{% set nav = 'audit' %}
+{% block title %}操作审计 · 源码自动化审计平台{% endblock %}
+{% block content %}
+
+<div class="page-head">
+  <div>
+    <div class="page-title">操作审计</div>
+    <div class="page-sub">记录变更类 API、登录与 Agent 调用；不记录请求体、密码与密钥</div>
+  </div>
+  <div class="head-actions">
+    <button class="btn" id="btn-audit-refresh">刷新</button>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-title">近 24 小时动作 <span class="hint">按 action 聚合</span></div>
+  <div id="audit-summary" class="muted">加载中…</div>
+</div>
+
+<div class="card">
+  <div class="card-title">审计事件 <span class="hint">最新 200 条</span></div>
+  <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px">
+    <select id="audit-action" class="mini" style="min-width:180px">
+      <option value="">全部动作</option>
+    </select>
+    <input id="audit-target" type="text" placeholder="目标，如 task:95" style="max-width:220px">
+    <button class="btn btn-sm" id="btn-audit-filter">筛选</button>
+  </div>
+  <div class="tbl-wrap" style="max-height:560px;overflow:auto">
+    <table class="tbl">
+      <thead>
+        <tr>
+          <th style="width:150px">时间</th>
+          <th style="width:150px">动作</th>
+          <th style="width:110px">目标</th>
+          <th style="width:80px">身份</th>
+          <th style="width:70px">状态</th>
+          <th style="width:70px">耗时</th>
+          <th style="width:110px">IP</th>
+          <th>路径</th>
+        </tr>
+      </thead>
+      <tbody id="audit-body"></tbody>
+    </table>
+  </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+const AUDIT_ACTIONS = [
+  'task.create', 'task.delete', 'task.resume', 'task.cancel',
+  'chain.generate', 'chain.verify', 'tool.scan', 'authz.probe',
+  'config.update', 'intel.run', 'intel.watchlist.add', 'intel.watchlist.delete',
+  'variant.scan', 'agent.next', 'agent.progress', 'agent.heartbeat',
+  'agent.complete', 'agent.release', 'agent.exec', 'agent.request', 'auth.login'
+];
+
+function auditStatusPill(status) {
+  const cls = status >= 400 ? 'pill-bad' : (status >= 200 ? 'pill-ok' : 'pill-dim');
+  return `<span class="pill ${cls}">${status || '—'}</span>`;
+}
+
+async function loadAuditSummary() {
+  const el = document.getElementById('audit-summary');
+  try {
+    const d = await SAP.api('/api/audit/summary?hours=24');
+    const items = d.items || [];
+    el.innerHTML = items.length
+      ? items.map(x => `<span class="stack-tag" style="margin:0 6px 6px 0">${SAP.esc(x.action)} × ${x.count}</span>`).join('')
+      : '<span class="muted">近 24 小时没有变更类操作</span>';
+  } catch (e) {
+    el.textContent = '统计读取失败：' + e.message;
+  }
+}
+
+async function loadAuditEvents() {
+  const body = document.getElementById('audit-body');
+  const action = document.getElementById('audit-action').value;
+  const target = document.getElementById('audit-target').value.trim();
+  const params = new URLSearchParams({ limit: '200' });
+  if (action) params.set('action', action);
+  if (target) params.set('target', target);
+  try {
+    const d = await SAP.api('/api/audit/events?' + params.toString());
+    const items = d.items || [];
+    body.innerHTML = items.map(x => `
+      <tr>
+        <td class="muted" style="font-size:11px">${SAP.esc(String(x.ts || '').replace('T', ' '))}</td>
+        <td><code>${SAP.esc(x.action)}</code></td>
+        <td><code>${SAP.esc(x.target || '—')}</code></td>
+        <td>${SAP.esc(x.actor || '—')}</td>
+        <td>${auditStatusPill(x.status)}</td>
+        <td class="muted">${x.duration_ms || 0} ms</td>
+        <td class="muted" style="font-size:11px">${SAP.esc(x.ip || '—')}</td>
+        <td><code style="font-size:11px">${SAP.esc(x.path || '')}</code></td>
+      </tr>`).join('') || '<tr><td colspan="8"><div class="empty">暂无审计事件；执行一次扫描、配置保存或链验证后会出现</div></td></tr>';
+  } catch (e) {
+    body.innerHTML = `<tr><td colspan="8"><div class="empty">读取失败：${SAP.esc(e.message)}</div></td></tr>`;
+  }
+}
+
+function initAuditActions() {
+  const sel = document.getElementById('audit-action');
+  if (sel.options.length > 1) return;
+  sel.innerHTML += AUDIT_ACTIONS.map(a => `<option value="${a}">${a}</option>`).join('');
+}
+
+async function refreshAudit() {
+  initAuditActions();
+  await Promise.all([loadAuditSummary(), loadAuditEvents()]);
+}
+
+document.getElementById('btn-audit-refresh').addEventListener('click', refreshAudit);
+document.getElementById('btn-audit-filter').addEventListener('click', () => {
+  loadAuditEvents();
+  loadAuditSummary();
+});
+document.getElementById('audit-target').addEventListener('keydown', e => {
+  if (e.key === 'Enter') { e.preventDefault(); loadAuditEvents(); }
+});
+refreshAudit();
+</script>
+{% endblock %}

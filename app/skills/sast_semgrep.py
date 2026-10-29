@@ -1,9 +1,10 @@
 """SAST skill：调用 semgrep 用内置规则 + 官方规则集缓存扫描源码（阶段 1 扩展：多语言多栈）"""
 import json
+import os
 import subprocess
 from pathlib import Path
 
-from app.config import TASK_TIMEOUT, DATA_DIR
+from app.config import SAST_TIMEOUT, DATA_DIR
 
 RULES_DIR = Path(__file__).parent / "rules"
 RULE_LANG_FILES = {
@@ -40,11 +41,11 @@ OFFICIAL_LANG = {
     "go": ["p/golang"],
     "csharp": ["p/csharp"],
 }
-# 扫描超时：附加官方规则集后单栈扫描放宽到 10 分钟（大项目多规则集可能变慢）
-SAST_TIMEOUT_OFFICIAL = 600
+# 扫描超时：大源码默认 30 分钟，可用 AUDIT_SAST_TIMEOUT 调整
+SAST_TIMEOUT_OFFICIAL = SAST_TIMEOUT
 
 
-def _run_semgrep(configs: list[str], workspace: str, timeout: int = TASK_TIMEOUT) -> list[dict]:
+def _run_semgrep(configs: list[str], workspace: str, timeout: int = SAST_TIMEOUT) -> list[dict]:
     """执行一次 semgrep，返回原始 results 列表"""
     cmd = ["semgrep", "--json", "--quiet", "--no-git-ignore",
            "--metrics=off", "--disable-nosem", "--max-memory", "2048"]
@@ -150,7 +151,7 @@ def run_sast(workspace: str, techs: list[str] | str) -> list[dict]:
             configs += official
         if not configs:
             configs = ["auto"]  # 完全无规则时兜底 auto
-        timeout = SAST_TIMEOUT_OFFICIAL if (official and i == 0) else TASK_TIMEOUT
+        timeout = SAST_TIMEOUT_OFFICIAL
         try:
             all_results += _run_semgrep(configs, workspace, timeout=timeout)
         except RuntimeError as e:
@@ -190,12 +191,60 @@ def _post_process(all_results, workspace: str):
         if cat_key in seen:
             continue
         seen.add(cat_key)
+        snippet = _clean_text(r.get("extra", {}).get("lines") or r.get("extra", {}).get("message") or "")[:1000]
+        # semgrep 新版登录墙会把 extra.lines 打码成 "requires login"（含本地规则）——
+        # 按位置自读源码兜底，保证报告里的代码片段是真实代码
+        if not snippet or "requires login" in snippet.lower():
+            try:
+                src_lines = (Path(workspace) / fp).read_text(errors="ignore").splitlines()
+                snippet = "\n".join(src_lines[max(0, line - 2): line + 1])[:1000]
+            except Exception:
+                pass
         vulns.append({
             "rule_id": check_id,
             "severity": (r.get("extra", {}).get("severity") or "").upper(),
             "file_path": fp,
             "line": line,
-            "code_snippet": _clean_text(r.get("extra", {}).get("lines") or r.get("extra", {}).get("message") or "")[:1000],
+            "code_snippet": snippet,
             "message": _clean_text(r.get("extra", {}).get("message", "")),
         })
-    return vulns
+    return _aggregate_noisy(vulns)
+
+
+# 高频低信噪规则：按“规则 + 文件”聚合，避免一个 HTML 文件里几百个 inline script
+# 或每个 form 一条 CSRF，把报告淹没。保留首条位置与命中次数，明细仍可回源码。
+AGGREGATE_RULE_MARKERS = (
+    "html-inline-script", "html-form-no-csrf", "html-http-resource",
+    "plaintext-http-link", "unrestricted-request-mapping",
+)
+MAX_SAST_FINDINGS = int(os.environ.get("AUDIT_MAX_SAST_FINDINGS", "8000"))
+
+
+def _aggregate_noisy(vulns):
+    out, groups = [], {}
+    for v in vulns:
+        rule = str(v.get("rule_id", "")).lower()
+        noisy = (v.get("severity") in ("INFO", "LOW")
+                 or any(m in rule for m in AGGREGATE_RULE_MARKERS))
+        if noisy:
+            key = (v.get("rule_id"), v.get("file_path"))
+            if key in groups:
+                groups[key]["_count"] = groups[key].get("_count", 1) + 1
+                continue
+            v = dict(v)
+            v["_count"] = 1
+            groups[key] = v
+        out.append(v)
+    for v in groups.values():
+        count = v.pop("_count", 1)
+        if count > 1:
+            v["message"] = (v.get("message", "") + "；同文件共 %d 处命中" % count)[:300]
+            v["code_snippet"] = (v.get("code_snippet", "") + "\n[聚合] 同文件 %d 处，仅展示首处" % count)[:1200]
+    out.sort(key=lambda x: {"ERROR": 0, "HIGH": 0, "WARNING": 1, "MEDIUM": 1,
+                            "INFO": 2, "LOW": 2}.get(x.get("severity"), 3))
+    if len(out) > MAX_SAST_FINDINGS:
+        import logging
+        logging.getLogger("sast").warning(
+            "semgrep 结果 %d 条，按严重性截取前 %d 条", len(out), MAX_SAST_FINDINGS)
+        out = out[:MAX_SAST_FINDINGS]
+    return out

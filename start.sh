@@ -1,11 +1,25 @@
-#!/bin/bash
-# 平台启动脚本：AUTH_TOKEN 启用后所有页面/接口需登录
-# 浏览器：http://<host>:8000/login 账号密码登录（AUTH_USER / AUTH_PASS）
-# 脚本/API：请求头 Authorization: Bearer <AUTH_TOKEN>
-export AUTH_TOKEN="${AUTH_TOKEN:-Audit-r9wtmwdcpf}"
-export AUTH_USER="${AUTH_USER:-Xudde}"
-export AUTH_PASS="${AUTH_PASS:-123456}"
-cd /opt/source-audit-platform
+#!/usr/bin/env bash
+# ISeeCode start script: requires AUTH_TOKEN; browser login needs AUTH_USER/AUTH_PASS.
+set -e
+cd "$(dirname "$0")"
+
+if [ -z "${AUTH_TOKEN:-}" ]; then
+  echo "请先设置 AUTH_TOKEN，例如:" >&2
+  echo "  export AUTH_TOKEN=\$(python3 -c 'import secrets;print(secrets.token_urlsafe(24))')" >&2
+  exit 1
+fi
+export AUTH_TOKEN
+export AUTH_USER="${AUTH_USER:-admin}"
+export AUTH_PASS="${AUTH_PASS:-}"
+export TZ="${TZ:-Asia/Shanghai}"
+export AUDIT_MOBSF_URL="${AUDIT_MOBSF_URL:-http://127.0.0.1:8010}"
+export AUDIT_MOBSF_KEY="${AUDIT_MOBSF_KEY:-}"
+
+if [ ! -f .venv/bin/activate ]; then
+  echo "缺少 .venv，请先执行:" >&2
+  echo "  python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt" >&2
+  exit 1
+fi
 source .venv/bin/activate
-nohup uvicorn app.main:app --host 0.0.0.0 --port 8000 > uvicorn.log 2>&1 < /dev/null &
+nohup uvicorn app.main:app --host 0.0.0.0 --port "${PORT:-8000}" > uvicorn.log 2>&1 < /dev/null &
 echo "PID=$!"

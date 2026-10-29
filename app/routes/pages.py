@@ -7,6 +7,7 @@ from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 
 from app.audit_labels import vuln_label
+from app.config import MAX_UPLOAD_SIZE
 from app.models import Task, Vulnerability
 from app.routes.api_config import get_db
 
@@ -25,7 +26,8 @@ def index(request: Request, db: Session = Depends(get_db)):
     # Starlette 1.9 新签名：TemplateResponse(request, name, context)
     return TEMPLATES.TemplateResponse(
         request, "index.html",
-        {"tasks": tasks, "active_tasks": active_tasks, "done_tasks": done_tasks},
+        {"tasks": tasks, "active_tasks": active_tasks, "done_tasks": done_tasks,
+         "max_upload_mb": MAX_UPLOAD_SIZE // 1024 // 1024},
     )
 
 
@@ -41,6 +43,41 @@ def task_detail(request: Request, task_id: int, db: Session = Depends(get_db)):
     )
 
 
+@router.get("/dashboard", response_class=HTMLResponse)
+def dashboard(request: Request):
+    return TEMPLATES.TemplateResponse(request, "dashboard.html", {})
+
+
 @router.get("/config", response_class=HTMLResponse)
 def config_page(request: Request):
     return TEMPLATES.TemplateResponse(request, "config.html", {})
+
+
+@router.get("/engines", response_class=HTMLResponse)
+def engines_page(request: Request):
+    return TEMPLATES.TemplateResponse(request, "engines.html", {})
+
+
+@router.get("/history", response_class=HTMLResponse)
+def history_page(request: Request):
+    return TEMPLATES.TemplateResponse(request, "history.html", {})
+
+
+@router.get("/auto", response_class=HTMLResponse)
+def auto_page(request: Request):
+    return TEMPLATES.TemplateResponse(request, "auto.html", {})
+
+
+@router.get("/intel", response_class=HTMLResponse)
+def intel_page(request: Request):
+    return TEMPLATES.TemplateResponse(request, "intel.html", {})
+
+
+@router.get("/audit", response_class=HTMLResponse)
+def audit_page(request: Request):
+    return TEMPLATES.TemplateResponse(request, "audit.html", {})
+
+
+@router.get("/verified", response_class=HTMLResponse)
+def verified_page(request: Request):
+    return TEMPLATES.TemplateResponse(request, "verified.html", {})

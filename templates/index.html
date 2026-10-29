@@ -6,7 +6,7 @@
 <div class="page-head">
   <div>
     <div class="page-title">审计任务</div>
-    <div class="page-sub">上传源码包，平台自动完成：静态扫描 → LLM 误报研判 → Docker 沙箱 POC 验证 → Agent 全量审计 → 生成报告</div>
+    <div class="page-sub">上传源码包，平台自动完成：静态扫描（规则 + 四引擎） → LLM 误报研判 → 沙箱 POC（仅自包含应用） → Agent 全量审计（大仓库自动熔断） → 报告</div>
   </div>
   <div class="head-actions" id="overview-chips"></div>
 </div>
@@ -18,14 +18,15 @@
     <div class="dropzone" id="dropzone">
       <svg class="dz-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
       <div class="dz-main" id="dz-main">拖拽文件到此处，或 <b>点击选择</b></div>
-      <div class="dz-sub" id="dz-sub">源码包 / 应用 / 镜像 / 编译产物，最大 200MB</div>
-      <input type="file" id="file-input" hidden
-             accept=".zip,.apk,.tar,.dockerfile,Dockerfile,.jar,.war,.class,.dex,.dll,.exe,.pyc,.so,.elf,.bin">
+      <div class="dz-sub" id="dz-sub">源码包 / 驱动 / 应用 / 镜像 / 编译产物，最大 {{ max_upload_mb|default(4096) }}MB</div>
+      <input type="file" id="file-input" hidden multiple
+             accept=".zip,.sys,.apk,.tar,.dockerfile,Dockerfile,.jar,.war,.class,.dex,.dll,.exe,.pyc,.so,.elf,.bin">
     </div>
     <div class="upload-meta">
       <div class="seg">
         <label><input type="radio" name="audit_mode" value="full" checked><span>完整审计（Agent 研判 + 全量审计）</span></label>
-        <label><input type="radio" name="audit_mode" value="static"><span>仅静态扫描（不耗 token）</span></label>
+        <label><input type="radio" name="audit_mode" value="static"><span>仅静态扫描（不耗 token，不部署沙箱）</span></label>
+        <label><input type="radio" name="audit_mode" value="poc"><span>沙箱 POC 验证（0 token）</span></label>
       </div>
       <button type="submit" class="btn btn-primary" id="btn-upload">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
@@ -35,11 +36,13 @@
     </div>
     <div class="progress" id="prog"><i id="prog-bar"></i></div>
     <div class="support-types">
-      <span class="type-chip">.zip 源码包</span><span class="type-chip">.apk 应用分析</span><span class="type-chip">.tar 镜像 / Dockerfile 基线</span>
+      <span class="type-chip">.zip 源码包</span><span class="type-chip">.sys Windows 驱动</span><span class="type-chip">.apk 应用分析</span><span class="type-chip">.tar 镜像 / Dockerfile 基线</span>
       <span class="type-chip">.jar/.war/.class → Java</span><span class="type-chip">.dex → Android</span><span class="type-chip">.dll/.exe → C#</span>
       <span class="type-chip">.pyc → Python</span><span class="type-chip">.so/.elf/.bin → 字符串特征</span>
     </div>
     <div class="tip-box"><b>省钱建议</b>：相同文件自动去重不重复消耗 token。先用「仅静态扫描」免费看 semgrep 命中与组件指纹，确认有值得深挖的疑点后再跑完整审计；中途中停止的任务可随时「继续」续跑，已研判部分不会重复计费。</div>
+    <div class="tip-box"><b>能力边界（如实告知）</b>：完整审计中的全量审计在源码文件超过 500 个时自动熔断（可在「平台设置」调整）；Docker 沙箱为禁网环境，仅 php / 自包含 python 小项目可自动部署，真实 Java/Node 项目通常无法做 POC——任务页会明确标注「未验证」，不会伪造成已复现。</div>
+    <div class="tip-box"><b>驱动审计说明</b>：.sys 做静态 PE 审计（导入/签名/节属性/设备与内存等攻击面）+ <b>capa 能力识别 + Ghidra 反汇编伪 C（如已安装）</b>，<b>不加载驱动</b>，IOCTL 逻辑与 DACL 需人工复核；系统自带驱动常用目录签名（.cat），平台只能检测嵌入签名，签名结论请在 Windows 上用 Get-AuthenticodeSignature 复核。</div>
   </form>
 </div>
 
@@ -60,14 +63,22 @@
     <tbody id="done-body"></tbody>
   </table>
 </div>
+<div class="pager" id="done-pager"></div>
 
 {% endblock %}
 
 {% block scripts %}
 <script>
 const FINAL = SAP.FINAL;
+const MAX_UPLOAD_MB = {{ max_upload_mb|default(4096) }};
 let tasks = [];
 let uploading = false;
+let selectedFiles = [];
+const TASK_PAGE_SIZES = [10, 20, 50];
+let taskPage = 1;
+let taskPageSize = 10;
+try { taskPageSize = Number(localStorage.getItem('sap-task-page-size')) || 10; } catch (e) {}
+if (!TASK_PAGE_SIZES.includes(taskPageSize)) taskPageSize = 10;
 
 function rowActions(t, isActive) {
   let h = `<a class="btn btn-sm" href="/tasks/${t.id}">详情</a>`;
@@ -101,8 +112,21 @@ function render() {
   document.getElementById('done-count').textContent = done.length;
   document.getElementById('active-body').innerHTML = active.map(renderRow).join('')
     || `<tr><td colspan="6"><div class="empty">当前没有进行中的审计任务</div></td></tr>`;
-  document.getElementById('done-body').innerHTML = done.map(renderRow).join('')
+  const pages = Math.max(1, Math.ceil(done.length / taskPageSize));
+  if (taskPage > pages) taskPage = pages;
+  const start = (taskPage - 1) * taskPageSize;
+  const donePageTasks = done.slice(start, start + taskPageSize);
+  document.getElementById('done-body').innerHTML = donePageTasks.map(renderRow).join('')
     || `<tr><td colspan="6"><div class="empty">暂无历史任务</div></td></tr>`;
+  taskPage = SAP.renderPager(
+    document.getElementById('done-pager'), done.length, taskPage, taskPageSize,
+    TASK_PAGE_SIZES,
+    (page, size) => {
+      taskPage = page;
+      taskPageSize = size;
+      try { localStorage.setItem('sap-task-page-size', String(size)); } catch (e) {}
+      render();
+    });
   const ok = done.filter(t => t.status === 'completed').length;
   document.getElementById('overview-chips').innerHTML =
     `<span class="fchip">全部 <span class="n">${tasks.length}</span></span>` +
@@ -128,68 +152,74 @@ dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('dra
 dz.addEventListener('dragleave', () => dz.classList.remove('drag'));
 dz.addEventListener('drop', e => {
   e.preventDefault(); dz.classList.remove('drag');
-  if (e.dataTransfer.files.length) setFile(e.dataTransfer.files[0]);
+  setFiles(e.dataTransfer.files);
 });
-fileInput.addEventListener('change', () => { if (fileInput.files.length) setFile(fileInput.files[0]); });
+fileInput.addEventListener('change', () => setFiles(fileInput.files));
 
-function setFile(f) {
-  fileInput.files = new DataTransfer().files; // 清空原生选择，以 drop 的为准时同步
-  const dt = new DataTransfer(); dt.items.add(f); fileInput.files = dt.files;
+function setFiles(list) {
+  selectedFiles = Array.from(list || []);
+  if (!selectedFiles.length) return;
   dz.classList.add('has-file');
-  document.getElementById('dz-main').innerHTML = `<b>${SAP.esc(f.name)}</b>`;
-  document.getElementById('dz-sub').textContent = `${(f.size / 1048576).toFixed(2)} MB · 点击可重新选择`;
+  const first = selectedFiles[0];
+  const total = selectedFiles.reduce((s, f) => s + f.size, 0);
+  document.getElementById('dz-main').innerHTML =
+    selectedFiles.length === 1 ? `<b>${SAP.esc(first.name)}</b>` :
+    `<b>${SAP.esc(first.name)}</b> 等 ${selectedFiles.length} 个文件`;
+  document.getElementById('dz-sub').textContent =
+    `共 ${(total / 1048576).toFixed(2)} MB · 点击可重新选择`;
   msg.textContent = ''; msg.className = 'upload-msg';
+  if (selectedFiles.length === 1 && /\.sys$/i.test(first.name)) {
+    msg.textContent = '检测到 .sys 驱动：将自动使用静态 PE 审计（0 token，不加载驱动）';
+  }
 }
 
-document.getElementById('upload-form').addEventListener('submit', e => {
-  e.preventDefault();
-  if (uploading) return;
-  if (!fileInput.files.length) { msg.className = 'upload-msg err'; msg.textContent = '请先选择或拖入文件'; return; }
-  const file = fileInput.files[0];
-  const mode = document.querySelector('input[name=audit_mode]:checked').value;
+async function uploadOne(file, mode) {
   const fd = new FormData();
   fd.append('file', file);
   fd.append('audit_mode', mode);
+  const resp = await fetch('/api/tasks/upload', { method: 'POST', body: fd });
+  let data = null; try { data = await resp.json(); } catch (_) {}
+  return { ok: resp.ok, status: resp.status, data };
+}
 
+document.getElementById('upload-form').addEventListener('submit', async e => {
+  e.preventDefault();
+  if (uploading) return;
+  if (!selectedFiles.length) { msg.className = 'upload-msg err'; msg.textContent = '请先选择或拖入文件'; return; }
+  const mode = document.querySelector('input[name=audit_mode]:checked').value;
+  const files = selectedFiles.slice();
   uploading = true;
   const btn = document.getElementById('btn-upload');
-  btn.disabled = true;
-  btn.innerHTML = '<span class="spin"></span> 上传中…';
+  btn.disabled = true; btn.innerHTML = '<span class="spin"></span> 批量上传中…';
   document.getElementById('prog').classList.add('on');
-  msg.className = 'upload-msg'; msg.textContent = `上传中（${(file.size / 1048576).toFixed(1)}MB）…`;
-
-  const xhr = new XMLHttpRequest();
-  xhr.open('POST', '/api/tasks/upload');
-  xhr.upload.onprogress = ev => {
-    if (ev.lengthComputable) document.getElementById('prog-bar').style.width = Math.round(ev.loaded / ev.total * 100) + '%';
-  };
-  xhr.onload = () => {
-    let data = null; try { data = JSON.parse(xhr.responseText); } catch (_) {}
-    if (xhr.status >= 200 && xhr.status < 300) {
-      msg.className = 'upload-msg ok';
-      msg.textContent = `任务 #${data.id} 已创建，正在进入审计流水线…`;
-      SAP.toast(`任务 #${data.id} 创建成功`, 'ok');
-      fileInput.value = ''; dz.classList.remove('has-file');
-      document.getElementById('dz-main').innerHTML = '拖拽文件到此处，或 <b>点击选择</b>';
-      document.getElementById('dz-sub').textContent = '源码包 / 应用 / 镜像 / 编译产物，最大 200MB';
-      setTimeout(() => location.href = '/tasks/' + data.id, 900);
-    } else if (xhr.status === 409) {
-      msg.className = 'upload-msg err';
-      msg.textContent = data && data.detail ? data.detail : '重复文件';
-      const m = /任务 #(\d+)/.exec((data && data.detail) || '');
-      if (m) { msg.textContent += '，正在跳转…'; setTimeout(() => location.href = '/tasks/' + m[1], 1200); }
-    } else {
-      msg.className = 'upload-msg err';
-      msg.textContent = '上传失败：' + ((data && data.detail) || `HTTP ${xhr.status}`);
+  const created = [], duplicated = [], failed = [];
+  try {
+    for (let i = 0; i < files.length; i++) {
+      msg.className = 'upload-msg';
+      msg.textContent = `上传 ${i + 1}/${files.length}：${files[i].name}`;
+      document.getElementById('prog-bar').style.width = Math.round(i / files.length * 100) + '%';
+      const r = await uploadOne(files[i], mode);
+      if (r.ok) created.push(r.data.id);
+      else if (r.status === 409) duplicated.push(r.data?.detail || files[i].name);
+      else failed.push(files[i].name + '：' + ((r.data && r.data.detail) || `HTTP ${r.status}`));
     }
-  };
-  xhr.onerror = () => { msg.className = 'upload-msg err'; msg.textContent = '上传中断（网络问题），请重试'; };
-  xhr.onloadend = () => {
-    uploading = false; btn.disabled = false;
-    btn.innerHTML = '上传并开始审计';
-    setTimeout(() => { document.getElementById('prog').classList.remove('on'); document.getElementById('prog-bar').style.width = '0'; }, 800);
-  };
-  xhr.send(fd);
+    document.getElementById('prog-bar').style.width = '100%';
+    msg.className = 'upload-msg ok';
+    msg.textContent = `批量完成：创建 ${created.length} 个任务` +
+      (duplicated.length ? `，重复跳过 ${duplicated.length} 个` : '') +
+      (failed.length ? `，失败 ${failed.length} 个` : '') +
+      (created.length ? `（#${created.join(', #')}）` : '');
+    SAP.toast(`批量上传完成：${created.length} 个任务`, 'ok');
+    fileInput.value = ''; selectedFiles = []; dz.classList.remove('has-file');
+    document.getElementById('dz-main').innerHTML = '拖拽文件到此处，或 <b>点击选择</b>';
+    document.getElementById('dz-sub').textContent = `源码包 / 应用 / 镜像 / 编译产物，最大 ${MAX_UPLOAD_MB}MB`;
+    if (files.length === 1 && created.length === 1) setTimeout(() => location.href = '/tasks/' + created[0], 900);
+  } catch (err) {
+    msg.className = 'upload-msg err'; msg.textContent = '批量上传异常：' + err.message;
+  } finally {
+    uploading = false; btn.disabled = false; btn.innerHTML = '上传并开始审计';
+    setTimeout(() => { document.getElementById('prog').classList.remove('on'); document.getElementById('prog-bar').style.width = '0'; }, 1200);
+  }
 });
 
 /* ---------- 行内操作（事件委托） ---------- */

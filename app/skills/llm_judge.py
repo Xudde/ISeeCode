@@ -1,16 +1,60 @@
 """LLM 误报研判 skill：调用兼容 OpenAI 协议的 LLM 判断漏洞真实性"""
 import json
+from datetime import datetime
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    ZoneInfo = None
 
 from app.models import Config
+from app.secrets import decrypt
 from sqlalchemy.orm import Session
 
 
+def _parse_hhmm(value: str, default: str):
+    raw = (value or default).strip()
+    try:
+        h, m = raw.split(":", 1)
+        return int(h), int(m)
+    except (ValueError, AttributeError):
+        h, m = default.split(":", 1)
+        return int(h), int(m)
+
+
+def _in_window(now: datetime, start: str, end: str) -> bool:
+    sh, sm = _parse_hhmm(start, "23:00")
+    eh, em = _parse_hhmm(end, "08:45")
+    cur = now.hour * 60 + now.minute
+    s, e = sh * 60 + sm, eh * 60 + em
+    if s == e:
+        return True
+    if s < e:
+        return s <= cur < e
+    return cur >= s or cur < e
+
+
 def get_llm_config(db: Session) -> dict | None:
-    """读取 LLM 配置，未配置完整则返回 None（跳过研判）"""
+    """读取 LLM 配置；夜间窗口内优先使用 night_*，窗口外回落白天配置。
+    未配置完整则返回 None（跳过研判）。"""
     rows = {c.key: c.value for c in db.query(Config).all()}
     base_url = rows.get("base_url", "")
-    api_key = rows.get("api_key", "")
+    api_key = decrypt(rows.get("api_key", ""))
     model = rows.get("model", "")
+    night_enabled = str(rows.get("night_enabled", "0")).strip() == "1"
+    night_url = rows.get("night_base_url", "")
+    night_key = decrypt(rows.get("night_api_key", ""))
+    night_model = rows.get("night_model", "")
+    now = datetime.now()
+    tz_name = rows.get("night_tz", "Asia/Shanghai")
+    if ZoneInfo and tz_name:
+        try:
+            now = datetime.now(ZoneInfo(tz_name))
+        except Exception:
+            pass
+    if night_enabled and night_url and night_key and night_model and _in_window(
+            now, rows.get("night_start", "23:00"),
+            rows.get("night_end", "08:45")):
+        base_url, api_key, model = night_url, night_key, night_model
     if not (base_url and api_key and model):
         return None
     return {"base_url": base_url, "api_key": api_key, "model": model}

@@ -1,0 +1,114 @@
+{% extends "base.html" %}
+{% set nav = 'verified' %}
+{% block title %}动态复现 · 源码自动化审计平台{% endblock %}
+{% block content %}
+
+<div class="page-head">
+  <div>
+    <div class="page-title">动态复现</div>
+    <div class="page-sub">只显示沙箱/POC 动态验证通过的条目；静态代码命中不混进来</div>
+  </div>
+  <div class="head-actions">
+    <input type="text" id="verified-search" placeholder="搜索任务 / 文件 / 标题…" style="min-width:240px">
+    <select id="verified-sev" class="btn" style="min-width:120px">
+      <option value="">全部等级</option>
+      <option value="CRITICAL">CRITICAL</option>
+      <option value="ERROR">ERROR</option>
+      <option value="HIGH">HIGH</option>
+      <option value="WARNING">WARNING</option>
+      <option value="INFO">INFO</option>
+    </select>
+    <button class="btn" id="btn-refresh-verified">刷新</button>
+  </div>
+</div>
+
+<div class="stats" id="verified-stats"></div>
+
+<div class="card" style="padding:0;overflow:hidden">
+  <div class="tbl-wrap" style="border:none;border-radius:0">
+    <table class="tbl">
+      <thead><tr>
+        <th style="width:60px">#</th><th style="width:90px">等级</th>
+        <th>漏洞 / 任务</th><th style="width:190px">位置</th>
+        <th style="width:260px">POC</th><th style="width:120px">证据</th>
+      </tr></thead>
+      <tbody id="verified-body"></tbody>
+    </table>
+  </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+let verifiedItems = [];
+
+async function copyText(text) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    try { await navigator.clipboard.writeText(text); return; } catch (e) {}
+  }
+  const ta = document.createElement('textarea');
+  ta.value = text; ta.style.position = 'fixed'; ta.style.left = '-9999px';
+  document.body.appendChild(ta); ta.focus(); ta.select();
+  let ok = false; try { ok = document.execCommand('copy'); } catch (e) {}
+  document.body.removeChild(ta);
+  if (!ok) throw new Error('浏览器禁止复制');
+}
+
+function renderVerified() {
+  const q = document.getElementById('verified-search').value.toLowerCase().trim();
+  const sev = document.getElementById('verified-sev').value;
+  const items = verifiedItems.filter(x =>
+    (!sev || x.severity === sev) &&
+    (!q || [x.title, x.task_filename, x.file_path, x.rule_id].join(' ').toLowerCase().includes(q)));
+  const body = document.getElementById('verified-body');
+  body.innerHTML = items.map((x, i) => `
+    <tr>
+      <td class="tid">${i + 1}</td>
+      <td><span class="pill ${x.severity === 'INFO' ? 'na' : 'fp'}">${SAP.esc(x.severity)}</span></td>
+      <td>
+        <div class="fname">${SAP.esc(x.title)}</div>
+        <div class="muted" style="font-size:11px">
+          <a href="/tasks/${x.task_id}">#${x.task_id} ${SAP.esc(x.task_filename)}</a>
+          · ${SAP.esc(x.rule_id)}
+        </div>
+      </td>
+      <td><code>${SAP.esc(x.file_path)}:${x.line}</code></td>
+      <td>
+        <pre class="code" style="margin:0;max-height:110px;white-space:pre-wrap">${SAP.esc(x.payload || '—')}</pre>
+        ${x.payload ? `<button class="btn btn-sm" data-poc="${SAP.esc(x.payload)}">复制 POC</button>` : ''}
+      </td>
+      <td>
+        <details><summary>查看</summary>
+          ${x.chain ? `<div class="muted" style="white-space:normal;font-size:11px;max-width:520px;margin-bottom:6px">
+            利用链（${x.chain.verified ? '已验证' : '待验证'}）：${SAP.esc((x.chain.nodes || []).map(n => n.label || n.type || '').join(' → '))}</div>` : ''}
+          <div class="muted" style="white-space:pre-wrap;font-size:11px;max-width:520px">${SAP.esc((x.verify_result || '') + '\n' + (x.evidence || ''))}</div>
+        </details>
+      </td>
+    </tr>`).join('') || '<tr><td colspan="6"><div class="empty">还没有动态复现结果</div></td></tr>';
+  document.getElementById('verified-stats').innerHTML = `
+    <div class="stat s-ok"><div class="num">${verifiedItems.length}</div><div class="lbl">动态复现总数</div></div>
+    <div class="stat s-bad"><div class="num">${verifiedItems.filter(x => ['ERROR','CRITICAL','HIGH'].includes(x.severity)).length}</div><div class="lbl">严重/高危</div></div>
+    <div class="stat"><div class="num">${new Set(verifiedItems.map(x => x.task_id)).size}</div><div class="lbl">涉及任务</div></div>`;
+}
+
+document.getElementById('verified-body').addEventListener('click', async e => {
+  const btn = e.target.closest('[data-poc]');
+  if (!btn) return;
+  try { await copyText(btn.dataset.poc); SAP.toast('POC 已复制', 'ok'); }
+  catch (err) { SAP.toast('复制失败：' + err.message, 'err'); }
+});
+document.getElementById('verified-search').addEventListener('input', renderVerified);
+document.getElementById('verified-sev').addEventListener('change', renderVerified);
+document.getElementById('btn-refresh-verified').addEventListener('click', loadVerified);
+
+async function loadVerified() {
+  try {
+    const d = await SAP.api('/api/verified');
+    verifiedItems = d.items || [];
+    renderVerified();
+  } catch (e) { SAP.toast('读取动态复现失败：' + e.message, 'err'); }
+}
+loadVerified();
+</script>
+{% endblock %}

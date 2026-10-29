@@ -56,6 +56,9 @@ def _migrate() -> None:
             ("audit_mode", "VARCHAR(16) DEFAULT 'full'"),
             ("tokens_used", "INTEGER DEFAULT 0"),
         ],
+        "agent_runs": [
+            ("stage", "VARCHAR(16) DEFAULT ''"),
+        ],
     }
     with engine.connect() as conn:
         for table, cols in new_cols.items():

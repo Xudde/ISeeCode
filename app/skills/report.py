@@ -59,6 +59,14 @@ tr:last-child td{border-bottom:none}
 .pill.ok{background:#e2f5ec;color:#00a86b}.pill.no{background:#fdecec;color:#d63031}.pill.dash{background:#eef1f5;color:var(--muted)}
 .empty{background:var(--card);border:1px dashed var(--line);border-radius:10px;padding:28px;text-align:center;color:var(--muted)}
 .note{background:#f4f8ff;border:1px solid #cfe0f5;border-radius:10px;padding:10px 14px;font-size:12.5px;color:#3d5a80;margin:14px 0}
+.hot{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 18px;margin-bottom:12px}
+.hot-top{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
+.hot-rank{font-size:13px;color:var(--muted);font-weight:700}
+.hot-top code{font-size:13px;word-break:break-all;color:var(--brand);background:#f4f8ff;padding:1px 6px;border-radius:5px}
+.hot-score{margin-left:auto;font-size:12px;color:var(--brand);font-weight:600}
+.hot .why{font-size:13px;margin-top:7px}
+.hot .kv{margin:6px 0;font-size:13px}
+.hot .focus{margin-top:8px;font-size:12.5px;color:#3d5a80;background:#f4f8ff;border-radius:6px;padding:7px 10px}
 footer{text-align:center;color:var(--muted);font-size:12px;margin-top:36px}
 """
 
@@ -101,10 +109,11 @@ def _poc_pill(v: dict) -> str:
 
 
 def _vuln_card(i: int, v: dict) -> str:
-    snippet = html.escape((v.get("code_snippet") or "").strip()[:800])
+    snippet = html.escape((v.get("code_snippet") or "").strip()[:1600])
     payload = html.escape(v.get("poc_payload") or "")
     verify = html.escape(v.get("verify_result") or "")
     evidence = v.get("agent_evidence") or ""
+    is_codeql = str(v.get("rule_id") or "").startswith("codeql:")
     reason = v.get("llm_reason") or v.get("agent_reason") or ""
     confidence = v.get("agent_confidence") or v.get("llm_confidence") or "-"
     poc_cls = "result" + ("" if v.get("poc_verified") is True else " no")
@@ -128,7 +137,8 @@ def _vuln_card(i: int, v: dict) -> str:
     if verify:
         parts.append(f'<div class="{poc_cls}"><b>动态验证结果：</b>{verify}</div>')
     if evidence:
-        parts.append(f'<div class="evidence"><b>Agent 证据链：</b><pre>{html.escape(evidence)}</pre></div>')
+        label = "CodeQL 数据流路径" if is_codeql else "Agent 证据链"
+        parts.append(f'<div class="evidence"><b>{label}：</b><pre>{html.escape(evidence)}</pre></div>')
     parts.append(f'<pre class="code">{snippet}</pre>')
     parts.append("</div>")
     return "\n".join(parts)
@@ -159,7 +169,8 @@ def _fingerprint_dict(task) -> dict | None:
         return None
 
 
-def _build_ai_report(task, vulns: list[dict], real, false_positive, unjudged, poc_passed) -> dict:
+def _build_ai_report(task, vulns: list[dict], real, false_positive, unjudged, poc_passed,
+                     hotlist: dict | None = None) -> dict:
     """构建 AI 版结构化报告（schema: source-audit-report/1.0）"""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -203,12 +214,20 @@ def _build_ai_report(task, vulns: list[dict], real, false_positive, unjudged, po
 
     caveats = []
     if not dynamic_done:
-        caveats.append("全部 finding 的 POC 均未经动态验证（无可用沙箱或任务类型不支持），verdict 为静态研判结论，"
-                       "payload 字段未经实际触发确认")
+        caveats.append("全部 finding 的 POC 均未经动态验证（无可用沙箱或任务类型不支持；沙箱为禁网环境，"
+                       "真实 Java/Node 项目通常无法拉取依赖），verdict 为静态研判结论，payload 字段未经实际触发确认")
     if unjudged:
         caveats.append(f"{len(unjudged)} 条超出研判上限未处理，verdict=unjudged，可能包含真实漏洞")
     if (getattr(task, "audit_mode", "full") or "full") == "static":
         caveats.append("本任务为仅静态扫描模式，未执行 LLM/Agent 研判与动态验证")
+    if (getattr(task, "audit_mode", "full") or "full") == "poc":
+        caveats.append("本任务为沙箱 POC 验证模式，仅部署沙箱并验证命中，未执行 LLM/Agent 研判")
+    if getattr(task, "project_type", "") == "driver":
+        caveats.append("驱动审计为静态 PE/导入/启发式 + capa/Ghidra 反汇编（如已安装），未加载驱动；"
+                       "IOCTL/DACL 需人工复核")
+    audit_fused = "全量审计已熔断" in (getattr(task, "log", "") or "")
+    if audit_fused:
+        caveats.append("全量审计已按文件数熔断跳过（大仓库全量审计实测产出极低），静态扫描与 Agent 研判结果不受影响")
 
     return {
         "schema": "source-audit-report/1.0",
@@ -236,12 +255,14 @@ def _build_ai_report(task, vulns: list[dict], real, false_positive, unjudged, po
             "dynamic_verification_performed": dynamic_done,
         },
         "caveats": caveats,
+        "hotlist": hotlist or {},
         "findings": findings,
     }
 
 
-def run_report(task, vulns: list[dict]) -> str:
-    """生成三份报告：人看版 HTML（主）/ Markdown（存档）+ AI 版 JSON，返回 HTML 路径"""
+def run_report(task, vulns: list[dict], hotlist: dict | None = None) -> str:
+    """生成三份报告：人看版 HTML（主）/ Markdown（存档）+ AI 版 JSON，返回 HTML 路径。
+    hotlist：可选的人工深挖 Top-N 清单（hotlist.build 输出），为空则报告不含该章节。"""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     def _real(v):
@@ -256,10 +277,52 @@ def run_report(task, vulns: list[dict]) -> str:
     poc_passed = [v for v in vulns if v.get("poc_verified") is True]
     real.sort(key=lambda v: SEVERITY_ORDER.get((v.get("severity") or "").upper(), 3))
 
+    audit_note = ("；全量审计已按文件数熔断跳过（静态扫描与研判结果不受影响）"
+                  if "全量审计已熔断" in (getattr(task, "log", "") or "") else "")
+    driver_note = ("；驱动审计为静态 PE/导入/启发式 + capa/Ghidra 反汇编（如已安装），未加载驱动"
+                   if getattr(task, "project_type", "") == "driver" else "")
+    target_label = "驱动文件" if getattr(task, "project_type", "") == "driver" else "源码包"
     dynamic_note = ""
     if not any(v.get("poc_verified") is not None for v in vulns):
-        dynamic_note = ('<div class="note"><b>阅读提示</b>：本报告所有结论均为静态研判（未执行动态 POC 验证），'
-                        'verified 不代表 payload 已实际触发，请结合部署环境人工复核。</div>')
+        dynamic_note = ('<div class="note"><b>阅读提示</b>：本报告所有结论均为静态研判（未执行动态 POC 验证；'
+                        '沙箱为禁网环境，真实 Java/Node 项目通常无法部署），'
+                        'verified 不代表 payload 已实际触发，请结合部署环境人工复核'
+                        + audit_note + driver_note + '。</div>')
+
+    hot_section = ""
+    hot_md: list[str] = []
+    hot_items = (hotlist or {}).get("items") or []
+    if hot_items:
+        blocks = []
+        for it in hot_items:
+            finds = "".join(
+                f'<div class="kv"><b>命中</b><span>{_sev_badge(f.get("severity", ""))} '
+                f'{html.escape(str(f.get("title") or ""))}'
+                f'（第 {f.get("line", 0)} 行 · {html.escape(str(f.get("source") or ""))}）</span></div>'
+                for f in (it.get("findings") or [])[:5])
+            blocks.append(
+                '<div class="hot">'
+                f'<div class="hot-top"><span class="hot-rank">#{it.get("rank")}</span>'
+                f'<code>{html.escape(str(it.get("file_path") or ""))}</code>'
+                f'<span class="hot-score">优先级 {it.get("score")}</span></div>'
+                f'<div class="why"><b>为什么先看：</b>{html.escape("；".join(it.get("reasons") or []))}</div>'
+                + finds +
+                f'<div class="focus"><b>建议动作：</b>{html.escape(str(it.get("focus") or ""))}</div>'
+                '</div>')
+        hot_section = (
+            f"<h2>人工深挖 Top {len(hot_items)} 文件（按优先级）</h2>"
+            '<div class="note"><b>怎么用</b>：从第 1 个文件开始读，配合 Trae/Qoder 的'
+            '「单点打穿」提示词；不需要再从全仓目录重新扫。</div>'
+            + "".join(blocks))
+        hot_md = ["## 人工深挖 Top-N 文件（按优先级）", "",
+                  "> 从第 1 个文件开始读，配合 IDE Agent 的「单点打穿」提示词；不需要重新扫全仓。", ""]
+        for it in hot_items:
+            hot_md += [f"### {it.get('rank')}. `{it.get('file_path')}`（优先级 {it.get('score')}）", "",
+                       f"- **为什么先看**：{'；'.join(it.get('reasons') or [])}"]
+            for f in (it.get("findings") or [])[:5]:
+                hot_md.append(f"- **命中**：{f.get('severity')} {f.get('title')}"
+                              f"（第 {f.get('line')} 行 · {f.get('source')}）")
+            hot_md += [f"- **建议动作**：{it.get('focus', '')}", ""]
 
     sev_rows = "".join(
         f'<tr><td>{i}</td><td>{_sev_badge(v["severity"])}</td>'
@@ -274,6 +337,59 @@ def run_report(task, vulns: list[dict]) -> str:
         f"<h2>真实漏洞明细（{len(real)}）</h2>"
         + (vuln_cards if vuln_cards else '<div class="empty">未发现经确认的真实漏洞。</div>')
     )
+
+    real_keys = {(v.get("rule_id"), v.get("file_path"), v.get("line")) for v in real}
+    poc_only = [v for v in poc_passed
+                if (v.get("rule_id"), v.get("file_path"), v.get("line")) not in real_keys]
+    poc_section = ""
+    if poc_only:
+        poc_section = (
+            f"<h2>POC 动态复现明细（{len(poc_only)}）</h2>"
+            + "\n".join(_vuln_card(i, v) for i, v in enumerate(poc_only, 1))
+        )
+
+    cve_rows = [v for v in vulns
+                if str(v.get("rule_id", "")).startswith("giants:self-cve:")]
+    cve_section = ""
+    if cve_rows:
+        cve_table = "".join(
+            f'<tr><td>{i}</td><td>{_sev_badge(v.get("severity", ""))}</td>'
+            f'<td>{html.escape(v.get("title") or "")}</td>'
+            f'<td><code>{html.escape(v.get("file_path", ""))}:{v.get("line", "")}</code></td>'
+            f'<td>{html.escape((v.get("code_snippet") or "").split("；")[0])}</td></tr>'
+            for i, v in enumerate(cve_rows[:30], 1)
+        )
+        cve_section = (
+            f"<h2>项目自身版本 CVE（OSV，{len(cve_rows)}）</h2>"
+            '<div class="note">按项目自身名称+版本查询 OSV，只发送包名与版本号；'
+            "版本命中不等于已复现根因，需结合代码/部署确认。"
+            + ("仅展示前 30 条。" if len(cve_rows) > 30 else "") + "</div>"
+            "<table><thead><tr><th>#</th><th>等级</th><th>CVE / 包</th>"
+            "<th>位置</th><th>修复版本</th></tr></thead>"
+            f"<tbody>{cve_table}</tbody></table>"
+        )
+
+    authz_rows = [v for v in vulns
+                  if str(v.get("rule_id", "")).startswith("authz:")]
+    authz_section = ""
+    if authz_rows:
+        rows = "".join(
+            f'<tr><td>{i}</td><td>{_sev_badge(v.get("severity", ""))}</td>'
+            f'<td>{html.escape(v.get("title") or "")}</td>'
+            f'<td><code>{html.escape(v.get("file_path", ""))}:{v.get("line", "")}</code></td>'
+            f'<td><pre class="code" style="margin:0;white-space:pre-wrap">'
+            f'{html.escape(v.get("poc_payload") or "")}</pre></td></tr>'
+            for i, v in enumerate(authz_rows[:30], 1)
+        )
+        authz_section = (
+            f"<h2>未授权接口候选（静态，{len(authz_rows)}）</h2>"
+            '<div class="note">未发现鉴权标记 ≠ 未授权；全局中间件/框架安全配置需'
+            "沙箱无凭证验证。以下为候选与 POC 请求，未动态验证前不要写成已复现。"
+            + ("仅展示前 30 条。" if len(authz_rows) > 30 else "") + "</div>"
+            "<table><thead><tr><th>#</th><th>等级</th><th>接口</th>"
+            "<th>位置</th><th>无凭证 POC</th></tr></thead>"
+            f"<tbody>{rows}</tbody></table>"
+        )
 
     fp_line = ""
     fp = _fingerprint_dict(task)
@@ -302,7 +418,7 @@ def run_report(task, vulns: list[dict]) -> str:
     <h1>源码自动化审计报告</h1>
     <div class="meta">
       <span>任务 ID：#{task.id}</span>
-      <span>源码包：{html.escape(task.filename)}</span>
+      <span>{target_label}：{html.escape(task.filename)}</span>
       <span>技术栈：{html.escape(task.tech_stack)}</span>
       <span>生成时间：{now}</span>
     </div>
@@ -318,7 +434,11 @@ def run_report(task, vulns: list[dict]) -> str:
   </div>
 
   {dynamic_note}
+  {hot_section}
   {vuln_section}
+  {poc_section}
+  {cve_section}
+  {authz_section}
 
   <h2>静态扫描全量结果（{len(vulns)}）</h2>
   <table>
@@ -342,7 +462,7 @@ def run_report(task, vulns: list[dict]) -> str:
         "# 源码自动化审计报告",
         "",
         f"- **任务 ID**：{task.id}",
-        f"- **源码包**：{task.filename}",
+        f"- **{target_label}**：{task.filename}",
         f"- **技术栈**：{task.tech_stack}",
         f"- **生成时间**：{now}",
         "",
@@ -366,8 +486,11 @@ def run_report(task, vulns: list[dict]) -> str:
         "",
     ]
     if dynamic_note:
-        lines += ["> 阅读提示：本报告所有结论均为静态研判（未执行动态 POC 验证），verified 不代表 payload 已实际触发。", ""]
+        lines += ["> 阅读提示：本报告所有结论均为静态研判（未执行动态 POC 验证；沙箱为禁网环境，"
+                  "真实 Java/Node 项目通常无法部署），verified 不代表 payload 已实际触发"
+                  + audit_note + driver_note + "。", ""]
 
+    lines += hot_md
     lines += ["## 真实漏洞明细（按严重性排序）", ""]
     if not real:
         lines.append("未发现经确认的真实漏洞。")
@@ -387,7 +510,48 @@ def run_report(task, vulns: list[dict]) -> str:
         ]
         if evidence:
             lines += ["", "**Agent 证据链**：", "```", evidence, "```"]
-        lines += ["", "```", v["code_snippet"].strip()[:500], "```", ""]
+        lines += ["", "```", v["code_snippet"].strip()[:1200], "```", ""]
+    if poc_only:
+        lines += ["## POC 动态复现明细", ""]
+        for i, v in enumerate(poc_only, 1):
+            evidence = v.get("agent_evidence") or ""
+            lines += [
+                f"### {i}. [{v['severity']}] {_vt(v)} (`{v['rule_id']}`)",
+                "",
+                f"- **位置**：`{v['file_path']}:{v['line']}`",
+                f"- **POC 验证**：{_mk(v.get('poc_verified'))}"
+                f"{('：' + v.get('verify_result')) if v.get('verify_result') else ''}",
+                f"- **POC Payload**：`{v.get('poc_payload') or '—'}`",
+            ]
+            if evidence:
+                lines += ["", "**证据链**：", "```", evidence, "```"]
+            lines += ["", "```", v["code_snippet"].strip()[:1200], "```", ""]
+    if cve_rows:
+        lines += ["## 项目自身版本 CVE（OSV）", "",
+                  "> 按项目自身名称+版本查询 OSV，只发送包名与版本号；"
+                  "版本命中不等于已复现根因，需结合代码/部署确认。", ""]
+        if len(cve_rows) > 30:
+            lines += [f"> 共 {len(cve_rows)} 条，仅展示前 30 条。", ""]
+        lines += ["| # | 等级 | CVE / 包 | 位置 | 修复版本 |",
+                  "| --- | --- | --- | --- | --- |"]
+        for i, v in enumerate(cve_rows[:30], 1):
+            fix = (v.get("code_snippet") or "").split("；")[0]
+            lines.append(
+                f"| {i} | {v.get('severity')} | {_vt(v)} | "
+                f"`{v.get('file_path')}:{v.get('line')}` | {fix} |")
+        lines += [""]
+    if authz_rows:
+        lines += ["## 未授权接口候选（静态）", "",
+                  "> 未发现鉴权标记 ≠ 未授权；全局中间件/框架安全配置需沙箱无凭证验证。", ""]
+        if len(authz_rows) > 30:
+            lines += [f"> 共 {len(authz_rows)} 条，仅展示前 30 条。", ""]
+        lines += ["| # | 等级 | 接口 | 位置 | 无凭证 POC |",
+                  "| --- | --- | --- | --- | --- |"]
+        for i, v in enumerate(authz_rows[:30], 1):
+            poc = (v.get("poc_payload") or "").replace("\n", " / ")
+            lines.append(f"| {i} | {v.get('severity')} | {_vt(v)} | "
+                         f"`{v.get('file_path')}:{v.get('line')}` | `{poc}` |")
+        lines += [""]
     lines += ["## 静态扫描全量结果", "",
               "| # | 严重性 | 规则 | 位置 | 研判 | POC |", "| --- | --- | --- | --- | --- | --- |"]
     for i, v in enumerate(vulns, 1):
@@ -398,7 +562,8 @@ def run_report(task, vulns: list[dict]) -> str:
     md_out.write_text("\n".join(lines), encoding="utf-8")
 
     # ---------- JSON 版（AI 消费） ----------
-    ai = _build_ai_report(task, vulns, real, false_positive, unjudged, poc_passed)
+    ai = _build_ai_report(task, vulns, real, false_positive, unjudged, poc_passed,
+                          hotlist=hotlist)
     json_out = out.with_suffix(".json")
     json_out.write_text(json.dumps(ai, ensure_ascii=False, indent=2), encoding="utf-8")
 

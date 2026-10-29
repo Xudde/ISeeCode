@@ -13,15 +13,18 @@ for _d in (DATA_DIR, UPLOAD_DIR, WORKSPACE_DIR, REPORT_DIR):
 
 DB_URL = f"sqlite:///{DATA_DIR / 'app.db'}"
 
-# 全局安全红线常量
-MAX_UPLOAD_SIZE = 200 * 1024 * 1024      # 200MB
-MAX_EXTRACT_SIZE = 1024 * 1024 * 1024    # 1GB
-TASK_TIMEOUT = 300                       # 任务超时 5 分钟
+# 全局安全红线常量（大包可通过环境变量调整）
+MAX_UPLOAD_SIZE = int(os.environ.get("AUDIT_MAX_UPLOAD_MB", "4096")) * 1024 * 1024   # 默认 4GB
+MAX_EXTRACT_SIZE = int(os.environ.get("AUDIT_MAX_EXTRACT_MB", "10240")) * 1024 * 1024  # 默认 10GB
+TASK_TIMEOUT = int(os.environ.get("AUDIT_TASK_TIMEOUT", "300"))                         # 沙箱/反编译等 5 分钟
+SAST_TIMEOUT = int(os.environ.get("AUDIT_SAST_TIMEOUT", "1800"))                       # 大源码 semgrep 30 分钟
 
 # 允许上传的扩展名
 ALLOWED_EXTENSIONS = {".zip"}
 # 反编译输入扩展名（升级阶段 2）
 DECOMPILE_EXTENSIONS = {".jar", ".war", ".class", ".dex", ".dll", ".exe", ".pyc", ".so", ".elf", ".bin"}
+# Windows 驱动静态审计输入（阶段三）
+DRIVER_EXTENSIONS = {".sys"}
 
 # ---- Agent 审计引擎（升级阶段 3）----
 AGENT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", 15))          # 单条漏洞 Agent 步数硬上限

@@ -1,0 +1,93 @@
+{% extends "base.html" %}
+{% set nav = 'auto' %}
+{% block title %}自动深挖 · 源码自动化审计平台{% endblock %}
+{% block content %}
+
+<div class="page-head">
+  <div>
+    <div class="page-title">自动深挖</div>
+    <div class="page-sub">给 Zcode 自动化一条固定提示词：每小时领一个“有沙箱”的未完成深挖任务，checkpoint 续跑，完成后回写；静态任务不会发 token</div>
+  </div>
+  <div class="head-actions">
+    <button class="btn" id="btn-refresh-auto">刷新状态</button>
+  </div>
+</div>
+
+<div class="form-row">
+  <div class="card">
+    <div class="card-title">Zcode 自动化提示词 <span class="hint">填一次即可，每小时新会话复用</span></div>
+    <div class="tip-box">
+      1. 在 Zcode 自动化里选择“每小时执行”，提示词整段粘贴；<br>
+      2. 项目根目录放 <code>.iseecode_agent_token</code>，内容为平台 AUTH_TOKEN（不是宿主 root，不要发公开仓库）；<br>
+      3. 平台按任务租约/checkpoint 控制，不会让两个会话同时深挖同一任务；<br>
+      4. 夜间 23:00–08:45 执行，08:30 后停止开新任务。
+    </div>
+    <div style="margin-top:12px">
+      <button class="btn btn-primary" id="btn-copy-auto">复制长会话版（Qoder）</button>
+      <button class="btn" id="btn-copy-short">复制短会话版（Zcode 24s）</button>
+      <a class="btn" href="/api/agent/state" target="_blank">查看 JSON 状态</a>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">深挖状态 <span class="hint">平台侧勾选/租约/checkpoint</span></div>
+    <div class="tbl-wrap" style="max-height:420px;overflow:auto">
+      <table class="tbl">
+        <thead><tr><th>任务</th><th>深挖状态</th><th>阶段</th><th>租约</th><th>checkpoint</th></tr></thead>
+        <tbody id="auto-state-body"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function copyText(text) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    try { await navigator.clipboard.writeText(text); return; } catch (e) {}
+  }
+  const ta = document.createElement('textarea');
+  ta.value = text; ta.style.position = 'fixed'; ta.style.left = '-9999px';
+  document.body.appendChild(ta); ta.focus(); ta.select();
+  let ok = false; try { ok = document.execCommand('copy'); } catch (e) {}
+  document.body.removeChild(ta);
+  if (!ok) throw new Error('浏览器禁止复制');
+}
+
+let autoPrompt = '';
+let shortPrompt = '';
+async function loadPrompt() {
+  try { const d = await SAP.api('/api/agent/prompt'); autoPrompt = d.prompt; }
+  catch (e) { SAP.toast('读取提示词失败：' + e.message, 'err'); }
+}
+async function loadState() {
+  try {
+    const d = await SAP.api('/api/agent/state');
+    document.getElementById('auto-state-body').innerHTML = (d.items || []).map(x => `
+      <tr>
+        <td><a href="/tasks/${x.task_id}">#${x.task_id}</a> ${SAP.esc(x.filename)}</td>
+        <td><span class="pill ${x.deep_status === 'completed' ? 'ok' : (x.deep_status === 'running' ? 'na' : 'dash')}">${SAP.esc(x.deep_status)}</span></td>
+        <td class="muted" style="font-size:11px">${SAP.esc(x.stage || '—')}</td>
+        <td class="muted" style="font-size:11px">${SAP.esc(x.lease_until || '—')}</td>
+        <td class="muted" style="font-size:11px;max-width:360px;white-space:pre-wrap">${SAP.esc((x.checkpoint || '').slice(0, 160))}</td>
+      </tr>`).join('') || '<tr><td colspan="5"><div class="empty">暂无已完成任务</div></td></tr>';
+  } catch (e) { SAP.toast('读取状态失败：' + e.message, 'err'); }
+}
+document.getElementById('btn-copy-auto').addEventListener('click', async () => {
+  if (!autoPrompt) await loadPrompt();
+  try { await copyText(autoPrompt); SAP.toast('长会话提示词已复制', 'ok'); }
+  catch (e) { SAP.toast('复制失败：' + e.message, 'err'); }
+});
+document.getElementById('btn-copy-short').addEventListener('click', async () => {
+  try {
+    if (!shortPrompt) shortPrompt = (await SAP.api('/api/agent/prompt?style=short')).prompt;
+    await copyText(shortPrompt);
+    SAP.toast('Zcode 短会话提示词已复制', 'ok');
+  } catch (e) { SAP.toast('复制失败：' + e.message, 'err'); }
+});
+document.getElementById('btn-refresh-auto').addEventListener('click', loadState);
+loadPrompt(); loadState();
+</script>
+{% endblock %}

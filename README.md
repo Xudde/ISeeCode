@@ -1,142 +1,141 @@
-# 源码自动化审计平台
+# ISeeCode · 源码自动化审计平台
 
-上传项目源码 → 自动化代码审计（semgrep）→ LLM 误报研判 → Docker 沙箱自动部署 → POC 自动验证 → 生成 Markdown 审计报告。
+> 上传源码包 → 多引擎离线扫描 → 候选去重/研判 → 沙箱 POC 验证 → 中文报告
+>
+> 确定性引擎负责“不漏”，LLM/Agent 负责“研判与表达”，不把静态候选伪装成已复现漏洞。
 
-> 当前进度：**阶段 0（项目骨架）已完成**。上传/扫描/沙箱/POC 功能将在后续阶段实现。
+![dashboard](docs/screenshots/02_dashboard.png)
 
-## 启动说明
+## 这是什么
 
-环境要求：Ubuntu 22.04、Python 3.10+
+ISeeCode 是一个自托管的源码审计平台，面向 SRC/CVE 研究和开源项目审计。它把 semgrep、gitleaks、trivy、CodeQL、JS 情报、OSV 等能力接到同一套任务流水线中，并用 Docker 沙箱尝试复现候选问题。
+
+- **多引擎静态扫描**：semgrep 规则包 + gitleaks 密钥 + trivy 配置/依赖 CVE + CodeQL 数据流 + JS 端点/密钥情报 + OSV 自身版本 CVE
+- **沙箱 POC 验证**：Python/Node/PHP/Go/Java 项目在受限容器内启动；能验证就写 `poc_verified`，验证不了就如实报 `blocked`，不伪造 0day
+- **Agent 深挖（可选）**：兼容 OpenAI 协议的模型可用四阶段 ReAct（triage → exploit → verify → judge）；没有 API key 时纯规则/沙箱流程仍可运行
+- **审计与 RBAC**：变更类 API、登录和 Agent 调用写入 `audit_events`；支持 admin/auditor/viewer 三档令牌
+- **CLI**：`list / status / wait / submit / report / vulns / audit / stats`
+- **自定义规则**：把 Semgrep YAML 放进 `data/rules/`，新任务自动加载；Engine 注册表可在 `/engines` 查看
+- **工程安全**：沙箱 cap-drop ALL（保留 NET_BIND_SERVICE）、no-new-privileges、只读根、端口只绑 127.0.0.1；依赖阶段走受控 egress 白名单代理，装完不再直连外网
+- **自托管**：SQLite WAL + 本地报告，无强制云依赖；LLM 配置可留空
+
+支持输入：`.zip` 源码包、`.sys` Windows 驱动、`.apk`、`.tar` 镜像、Dockerfile，以及 `.jar/.war/.class/.dex/.dll/.exe/.pyc` 等反编译产物。
+
+## 截图
+
+| 总览仪表盘 | 任务列表 |
+|---|---|
+| ![dashboard](docs/screenshots/02_dashboard.png) | ![list](docs/screenshots/01_task_list.png) |
+
+| 任务详情 | 漏洞表 |
+|---|---|
+| ![detail](docs/screenshots/03_task_detail.png) | ![vulns](docs/screenshots/04_vuln_table.png) |
+
+| 报告 |
+|---|
+| ![report](docs/screenshots/05_report.png) |
+
+## 快速开始
+
+环境：Linux（Ubuntu 22.04 / Kali 均可）、Python 3.10+、Docker；建议 4C/8G。Windows 可用 WSL2 运行。
 
 ```bash
-# 1. 安装依赖
+git clone https://github.com/Xudde/ISeeCode.git
+cd ISeeCode
+
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 
-# 2. 启动服务
-uvicorn app.main:app --reload
+# 必填：服务端 API token（脚本/CLI 用）
+export AUTH_TOKEN="$(python3 -c 'import secrets;print(secrets.token_urlsafe(24))')"
+# 浏览器登录用；不设置则只能用 /login?token=$AUTH_TOKEN
+export AUTH_USER=admin
+export AUTH_PASS='换成你的密码'
 
-# 3. 浏览器访问
-#   首页（上传入口 + 任务列表）: http://127.0.0.1:8000/
-#   LLM 配置页:               http://127.0.0.1:8000/config
-#   API 文档:                 http://127.0.0.1:8000/docs
+bash start.sh
 ```
 
-## 目录结构
+浏览器打开 `http://127.0.0.1:8000`。首次启动会创建 `data/app.db`；`data/`、`master.key`、上传内容和工作区都不应提交到 Git。
 
-- `app/` 后端代码（FastAPI 入口、模型、路由、任务队列、skills 模块）
-- `templates/` Jinja2 页面
-- `static/` 静态资源
-- `semgrep_rules/` 内置扫描规则（阶段 1 填充）
-- `docker_templates/` 沙箱镜像模板（阶段 2 填充）
-- `data/` 运行时数据（uploads / workspaces / reports，已加入 .gitignore）
+> 如果使用 systemd/supervisor，请把 `AUTH_TOKEN`、`AUTH_USER`、`AUTH_PASS` 放进受保护的环境文件，不要写进仓库。
 
-## API 一览
+## 可选引擎
 
-| 方法 | 路径 | 功能 |
+| 引擎 | 依赖 | 说明 |
 |---|---|---|
-| POST | /api/tasks | 上传 zip 创建任务（阶段 1 实现） |
-| GET | /api/tasks | 任务列表 |
-| GET | /api/tasks/{id} | 任务详情 |
-| GET | /api/tasks/{id}/report | 下载 Markdown 报告（阶段 1 实现） |
-| GET | /api/config | 获取配置（api_key 脱敏为 sk-***xxxx） |
-| POST | /api/config | 更新 LLM 配置 |
+| semgrep | `pip install semgrep` | 内置规则 + `data/rules` 自定义规则 |
+| gitleaks | Docker 镜像 `zricethezav/gitleaks` | 首次扫描自动拉取 |
+| trivy | Docker 镜像 `aquasec/trivy` | 配置基线/密钥/依赖 CVE |
+| CodeQL | `codeql` CLI，默认 `/opt/giants/codeql` | 小仓库数据流；可用 `AUDIT_CODEQL_BIN` 覆盖 |
+| JS 情报 | 可选 mantra 二进制 | 无 mantra 时仍做端点/sourcemap 提取 |
+| MobSF | 可选容器 | APK 深度静态分析；未配置时仍做原生 Manifest/DEX |
+| LLM | OpenAI 兼容接口 | 不配置则跳过 LLM 研判，规则/沙箱流程不受影响 |
 
+## CLI
 
-## 升级改造（阶段0 P0 修复完成）
+```bash
+export ISEECODE_URL=http://127.0.0.1:8000
+export ISEECODE_TOKEN="$AUTH_TOKEN"
 
-- **鉴权**：设置环境变量 `AUTH_TOKEN=xxx` 后所有接口/页面需认证（`Authorization: Bearer <token>`、`?token=` 或 cookie）；未配置则启动时告警，建议仅本机/内网使用。登录入口 `/login?token=<AUTH_TOKEN>`
-- **沙箱安全**：容器运行于 internal 网络 `audit-sandbox-net`（禁出网），工作区只读挂载，512MB/1CPU/128pids 限制保留；POC 通过 `docker exec` 在容器内发请求
-- **队列恢复**：服务重启自动将非终态任务重置为 pending 重新入队
-- **SQLite WAL**：已启用，降低长事务锁冲突
-- **日志**：`data/server.log`（含 worker 异常堆栈）
-- **go 规则**：`app/skills/rules/go.yaml`（7 条），不再依赖 `--config auto`
-- **LLM 布尔容错**：严格 `isinstance(x, bool)` 校验，`"false"` 字符串不再误判
-
-### 启动
-```
-export AUTH_TOKEN=你的访问令牌
-pip install -r requirements.txt && uvicorn app.main:app --host 127.0.0.1 --port 8000
+python tools/iseecode_cli.py list --limit 20
+python tools/iseecode_cli.py submit project.zip --mode static --wait
+python tools/iseecode_cli.py status 42 --log 20
+python tools/iseecode_cli.py report 42 --format md --out task42.md
+python tools/iseecode_cli.py vulns 42 --verified
+python tools/iseecode_cli.py audit --limit 20
 ```
 
-## 升级改造（阶段1 多语言规则扩充完成）
+`--mode` 可选 `full`（静态 + 可选 LLM/Agent）、`static`（0 token 静态）、`poc`（沙箱验证，0 token）。
 
-- **新增 11 个语言规则集**（各 5~7 条）：`csharp / c / cpp / kotlin / ruby / rust / swift / dart / scala / typescript / html`，覆盖 SQL 注入、命令注入、eval 代码执行、反序列化、硬编码密钥、路径穿越、SSRF、弱加密、XSS 等类型；规则目录共 16 个语言文件
-- **tech_detect 多栈识别**：返回主栈 + 次栈列表（最多 4 个），marker 扩展至 `.csproj/.sln/CMakeLists.txt/Makefile/Cargo.toml/pubspec.yaml/build.sbt/Gemfile/Package.swift/tsconfig.json` 等；扩展名兜底覆盖 .cs/.c/.cpp/.kt/.rb/.rs/.swift/.dart/.scala/.tsx 等
-- **sast 多栈扫描**：一次任务按识别到的栈分别用对应规则扫描并去重合并；单栈扫描失败自动降级不中断任务
-- **官方规则集**：对 python/java/javascript/typescript/go/php 主栈自动附加 `p/security-audit` + `p/owasp-top-ten`（首次联网拉取约数秒，semgrep 本地缓存后离线可用；探测结果记录于 `data/official_rules.flag`，不可用时自动降级内置规则）。可用 `AUDIT_OFFICIAL_RULES=0` 关闭
-- **验收结果**：
-  - 10 种语言迷你漏洞样本全部命中对应规则（可复现：`/tmp/langtest` 生成逻辑见升级文档）
-  - JeecgBoot 3.9.5 全量扫描（984 Java + 1749 前端文件）：识别 java/typescript/javascript/html 四栈，88 秒检出 **1255 条**（含官方规则集贡献的 spring-sqli、unrestricted-request-mapping、insecure-trust-manager 等），远超 ≥20 条验收线
-  - 回归：test_vuln_app.zip 任务 completed，POC 验证 4/4 通过
+## 自定义规则
 
-## 升级改造（阶段2 反编译支持完成）
+```yaml
+# data/rules/my-rule.yaml
+rules:
+  - id: my-danger-call
+    languages: [python]
+    message: "调用了危险函数"
+    severity: WARNING
+    pattern: dangerous_func(...)
+```
 
-- **新增上传类型 `decompile`**：`.jar/.war/.class`（cfr→Java 源码）、`.dex`（jadx→Java 源码）、`.dll/.exe`（ilspycmd→C#，需 dotnet-sdk）、`.pyc`（pycdc/decompyle3→Python）、`.so/.elf/.bin`（原生二进制，仅字符串特征）
-- **流程**：上传 → sha256 缓存检查（`data/decompiled_cache/{kind}_{hash32}/`）→ 反编译产物落 `data/workspaces/task_N/decompiled/`（标注“反编译代码，行号仅供参考”）→ 按产物语言 tech_detect + semgrep 多栈扫描 → 报告
-- **失败降级**：工具缺失或反编译失败时自动降级为字节码字符串特征扫描（Runtime.exec/ObjectInputStream/DexClassLoader/JNDI 等 10 类危险 API 特征），任务不中断
-- **工具安装**：`bash scripts/install_decompilers.sh`（自动装 openjdk/cfr/jadx/apktool，可选 ilspycmd 与 decompyle3；本环境已装 cfr 0.152 + jadx 1.5.0）
-- **安全**：Zip Slip 防护保留；反编译目标数上限 200；缓存按内容 hash 复用
-- **验收结果**：
-  - vuln.jar（编译期注入 SQL 拼接+命令执行）：cfr 反编译 → 检出 3 条（官方 formatted-sql-string + 自研 sql-concat/command-concat），二次上传缓存秒级命中
-  - 真 dex（r8 编译生成）：jadx 反编译 → 检出 2 条（SQL 拼接 + 命令注入）
-  - fake_native.so（无源二进制）：正确降级字符串特征扫描，任务 completed 不中断
-  - 回归：web zip 任务 completed，POC 4/4；`.apk` 仍走原有 androguard 移动分析路径
+规则会先经过 `semgrep --validate`，无效文件会被跳过并写入任务日志；有效规则与内置规则包一起执行。默认最多加载 50 个文件，可用 `AUDIT_MAX_CUSTOM_RULES` 调整。更多说明见 [docs/CUSTOM_RULES.md](docs/CUSTOM_RULES.md)。
 
-## 升级改造（阶段3 Agent 审计引擎完成）
+## 架构
 
-- **架构**：保留 semgrep 预筛层，新增 Agent 深度研判层（`app/agent/`：react.py ReAct 循环 + tools.py 10 工具集 + orchestrator.py 调度）
-- **ReAct 循环**：Thought→ToolCall→Observation，每步一个 JSON；结论工具 `write_finding` 输出 verdict/evidence/payload/confidence；步数达上限或预算耗尽自动标记 `unverified`
-- **工具集**：read_file / search / list_dir / call_chain（Python AST 符号索引）/ route_map / run_semgrep_subset + 动态验证 http_request / sandbox_exec（沙箱存活期间可用）
-- **预算与并发**（均可环境变量覆盖）：单条 10 步硬上限、每任务 1.5M token 软上限、Agent 并发 3、沙箱动态验证全局并发 ≤2、候选数上限 20（严重性优先）
-- **数据模型**：Vulnerability 新增 agent_status/agent_evidence/agent_confidence/agent_reason/analyzed_at，旧库自动 ALTER TABLE 迁移；报告按 agent_status 分组，标注“Agent 深度验证 / 仅静态疑似”
-- **设计文档**：`docs/ARCHITECTURE.md`
-- **验收**：工具集冒烟（读文件/搜索/调用链/路由图/局部复扫全部正常）；Mock LLM 端到端（3 步完成 verified 结论，预算耗尽正确 unverified）；真实流水线回归（未配置 LLM 时 Agent 段正确跳过，web 任务 POC 4/4）
+```
+上传(zip/sys/apk/tar/dll…)
+  → 预处理/反编译 → 技术栈识别
+  → semgrep / gitleaks / trivy / CodeQL / JS 情报 / OSV
+  → Docker 沙箱 POC（受限网络 + 只读根）
+  → 可选 LLM/Agent 研判 → 中文报告（HTML/MD/JSON）
+```
 
-## 整改复查记录（四阶段联合复查后修复）
+技术栈：FastAPI + SQLAlchemy(SQLite WAL) + Jinja2 + Docker SDK + semgrep + OpenAI-compatible LLM。
 
-1. **[Bug] 沙箱过早销毁**：原实现 POC 结束即 `handle.cleanup()`，导致 Agent 深度研判的动态验证工具（http_request/sandbox_exec）拿到已销毁容器。已改为 Agent 段结束后统一销毁，并加异常保护
-2. **[Bug] exploitability 未落库**：Agent 结论中的可利用性评级原被丢弃，现写入 agent_evidence 前缀 `[exploitability=xxx]`
-3. **[Bug] 相对路径依赖**：反编译缓存与官方规则 flag 使用相对 `data/` 路径，工作目录不同时会写到错误位置；已改为 `DATA_DIR` 绝对路径
-4. **[Bug] route_map 重复条目**：同文件被多 pattern 重复命中，已去重
-5. **[清理] 历史文件归档**：`111.txt` 归档至 `docs/`；历史阶段 zip 包移至 `/workspace/archive/`
+更多见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)；阶段和边界见 [docs/ROADMAP.md](docs/ROADMAP.md)。
 
+## 目录
 
-## 升级改造（2026-10-25 大版本：报告双版本 + AI 命名/复现条件 + A/B/C 级修复）
+```
+app/                 后端流水线、引擎、Agent、报告
+app/skills/giants_rules/   内置授权/配置规则
+app/skills/egress_proxy.py 沙箱依赖阶段白名单代理
+data/rules/          自定义 Semgrep 规则（运行时目录）
+templates/ static/   Web UI
+tools/iseecode_cli.py CLI
+docs/                架构、路线、规则说明、截图
+```
 
-### 报告双版本
-- **人看版**：自包含 HTML（主）+ Markdown（存档），面向审计人员
-- **AI 版**：`task_{id}_report.json`（schema `source-audit-report/1.0`），结构化 task/summary/findings，附 `caveats` 数组显式说明「POC 未动态验证」「N 条未研判」等限定条件，供下游 AI/工单系统消费
-- 下载：`GET /api/tasks/{id}/report`（html）/ `?format=md` / `?format=json`
+## 安全与诚实边界
 
-### AI 漏洞命名与复现条件
-- 报告生成前自动批量（20 条/批）为漏洞生成**中文漏洞名**（如「SQL注入（订单号拼接查询）」）与**复现条件**（如「需登录学生账号」「匿名可达，需有效订单号」）
-- 落库字段 `title` / `precondition`；前端漏洞表、三种报告均优先展示；Agent 研判结论（write_finding.precondition）优先于批量生成
+- 沙箱不是“绝对安全”的虚拟机：容器隔离 + cap-drop + 只读根 + egress 白名单降低风险，但不等于能安全运行任意恶意样本。
+- `verified` 只代表候选在沙箱内被验证；不代表真实生产环境可利用，也不等于 0day。
+- 静态规则会有误报/漏报；LLM 结论需要人工复核；平台不承诺发现所有漏洞。
+- 依赖阶段白名单以包管理器域名族为默认；可按 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) 调整。工作区在依赖安装阶段仍为可写（Docker bind mount 限制），敏感场景请自行收紧。
+- 生产部署请设置强 `AUTH_TOKEN`/`AUTH_PASS`，不要把 `data/`、`master.key`、日志或真实 API key 提交到仓库。
 
-### UI 2.x
-- 深浅双主题（白天蓝白 / 夜间黑灰，侧边栏切换按钮，记忆+跟随系统）；左侧导航布局
-- 任务列表/详情 SPA 式免刷新轮询；实时日志终端（时间戳着色/自动滚动/一键复制）；漏洞多维筛选（结论/等级/搜索）；拖拽上传+进度条
-- 自托管 Lato / Fira Code 字体，内网零外部 CDN 依赖
+## License
 
-### 稳定性修复（A 级，均经真实任务回归）
-1. **反编译缓存 v2**：修复「共享输出目录被后处理二进制 rmtree 冲掉」的严重 bug（曾致 ASP.NET 发布包任务丢失全部控制器/鉴权源码，Agent 只能瞎猜路由与登录要求）；现在每个二进制私有临时目录 → 只缓存自身产物 → 合并进共享目录；v1 污染缓存自动失效
-2. **续跑去重**：重扫按 `(file_path, line, rule_id)` 复用已有漏洞记录，已研判条目不重复分析、不重复消耗 token；修复续跑预处理 `Is a directory` 崩溃（解压源改用 upload_path）
-3. **停止生效**：修复 worker 读取 ORM 缓存导致 API 写入的停止请求不可见的问题（db.refresh）
-4. **多栈沙箱**：tech_stack 逗号串按序逐栈尝试部署，多栈任务恢复 POC 与动态验证
-5. **tokens_used 落库**：Agent 研判与全量审计两阶段累计写入任务表
-
-### 修复（B 级）
-- http_request 工具：method 真正透传（原 POST 静默变 GET）、params/body 正确解析与 URL 编码
-- 全局沙箱并发闸唯一定义（原先两把信号量上限翻倍）
-- 删除任务仅限终态（封死「删除运行中任务 + rowid 复用 → 双跑」竞态）
-- token 估算 CJK 感知（中文 0.7 token/字）；POC 脚本 GET 参数 URL 编码；官方规则探测超时 90s→20s
-
-### 修复（C 级）与安全
-- **AUTH_TOKEN 默认启用**（start.sh 内置，浏览器访问 `http://<host>:8000/login?token=<AUTH_TOKEN>` 一次即写入 cookie；API 可带 `Authorization: Bearer <token>`）。修改 token 编辑 start.sh 后重启
-- 上传改流式落盘 + 增量哈希（不再整包进内存）；沙箱 exec 参数改 argv 传递（防特殊字符破坏脚本）；call_chain 过滤语言关键字噪音；移除未使用的 paramiko 依赖与空 semgrep_rules 目录；auth.py 登录死代码清理
-- 已知残留：LLM API Key 明文存于 SQLite（data/app.db），请确保平台仅部署于可信内网并保管服务器权限
-
-
-### 登录方式（2026-10-25 更新）
-- 浏览器访问 `http://<host>:8000/login`，使用账号密码登录（默认 `Xudde / 123456`，可在 `start.sh` 修改 `AUTH_USER/AUTH_PASS`）
-- 脚本/API 二选一：请求头 `Authorization: Bearer <AUTH_TOKEN>`，或 `GET /login?token=<AUTH_TOKEN>` 写 cookie
-- 登录失败有 1.2s 延时与日志记录；会话过期后页面自动跳回登录页
+MIT（见 [LICENSE](LICENSE)）；第三方引擎/工具遵循各自许可证，CodeQL 商用需遵循 GitHub 条款。

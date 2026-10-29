@@ -16,6 +16,8 @@ class TaskOut(BaseModel):
     cancel_requested: bool = False
     error_msg: str | None = None
     report_path: str | None = None
+    sandbox_cid: str | None = None
+    sandbox_port: int | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -65,12 +67,37 @@ class ConfigUpdate(BaseModel):
     full_audit_rounds: int | None = None
     full_audit_token_per_round: int | None = None
     full_audit_max_findings: int | None = None
+    full_audit_max_files: int | None = None
+    engine_jsintel: int | None = None
+    engine_codeql: int | None = None
+    engine_gitleaks: int | None = None
+    engine_trivy: int | None = None
+    engine_trivy_cve: int | None = None
+    engine_self_cve: int | None = None
+    engine_authz: int | None = None
+    codeql_ram_mb: int | None = None
+    codeql_threads: int | None = None
+    night_enabled: int | None = None
+    night_start: str = ""
+    night_end: str = ""
+    night_base_url: str = ""
+    night_api_key: str = ""
+    night_model: str = ""
+    night_tz: str = "Asia/Shanghai"
+    intel_enabled: int | None = None
+    intel_run_time: str = ""
+    intel_webhook_url: str = ""
+    intel_webhook_type: str = ""
 
 
 class ConfigOut(BaseModel):
     base_url: str
     api_key: str  # 脱敏后
     model: str
+    intel_enabled: str = "0"
+    intel_run_time: str = "21:30"
+    intel_webhook_url: str = ""
+    intel_webhook_type: str = "wecom"
     # Agent 引擎可调参数（当前生效值，字符串形式便于前端展示）
     agent_max_vulns: str = "20"
     agent_max_steps: str = "15"
@@ -79,3 +106,20 @@ class ConfigOut(BaseModel):
     full_audit_rounds: str = "3"
     full_audit_token_per_round: str = "400000"
     full_audit_max_findings: str = "8"
+    full_audit_max_files: str = "500"
+    engine_jsintel: str = "1"
+    engine_codeql: str = "1"
+    engine_gitleaks: str = "1"
+    engine_trivy: str = "1"
+    engine_trivy_cve: str = "1"
+    engine_self_cve: str = "1"
+    engine_authz: str = "1"
+    codeql_ram_mb: str = "4096"
+    codeql_threads: str = "2"
+    night_enabled: str = "0"
+    night_start: str = "23:00"
+    night_end: str = "08:45"
+    night_base_url: str = ""
+    night_api_key: str = ""
+    night_model: str = ""
+    night_tz: str = "Asia/Shanghai"

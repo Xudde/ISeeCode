@@ -106,3 +106,14 @@ rules:
           - pattern: passthru($X)
           - pattern: proc_open($X, ...)
           - pattern: popen($X, ...)
+  - id: php-xss-reflected
+    languages: [php]
+    severity: WARNING
+    message: 反射型 XSS：用户输入直接输出到 HTTP 响应
+    patterns:
+      - pattern-either:
+          - pattern: echo $_GET[...];
+          - pattern: echo $_POST[...];
+          - pattern: echo $_REQUEST[...];
+          - pattern: print $_GET[...];
+          - pattern: print $_POST[...];

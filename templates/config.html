@@ -27,6 +27,49 @@
     </div>
   </div>
 
+  <!-- ==================== 夜间 LLM 窗口 ==================== -->
+  <div class="card">
+    <div class="card-title">夜间 LLM 窗口 <span class="hint">23:00–08:45 用便宜/活动 Key，窗口外回落白天配置</span></div>
+    <label class="f-label"><input type="checkbox" id="c-night_enabled"> 启用夜间配置（仅时间窗内使用下面的 Key）</label>
+    <div style="display:flex;gap:10px">
+      <div style="flex:1"><label class="f-label"><b>开始</b> night_start</label><input type="time" id="c-night_start"></div>
+      <div style="flex:1"><label class="f-label"><b>结束</b> night_end</label><input type="time" id="c-night_end"></div>
+    </div>
+    <label class="f-label"><b>夜间 base_url</b> night_base_url</label>
+    <input type="text" id="c-night_base_url" placeholder="https://.../v1">
+    <label class="f-label"><b>夜间 API Key</b>（脱敏显示，留空不修改）</label>
+    <input type="text" id="c-night_api_key" placeholder="sk-…">
+    <label class="f-label"><b>夜间模型</b> night_model</label>
+    <input type="text" id="c-night_model" placeholder="glm-...">
+    <label class="f-label"><b>时区</b> night_tz <span class="muted">— 例如 Asia/Shanghai；服务器是 EDT，必须填对</span></label>
+    <input type="text" id="c-night_tz" placeholder="Asia/Shanghai">
+    <div class="tip-box" style="margin-top:12px"><b>用法</b>：白天配置保留 DeepSeek；夜间窗口内自动切到活动 Key。窗口外、Key 不完整或过期时自动回落白天配置，不会强行调用。</div>
+    <div style="margin-top:14px;display:flex;gap:10px">
+      <button class="btn btn-primary" id="btn-save-night">保存夜间配置</button>
+      <span class="muted" style="align-self:center;font-size:12px" id="night-saved"></span>
+    </div>
+  </div>
+
+  <!-- ==================== 情报闭环 ==================== -->
+  <div class="card">
+    <div class="card-title">情报闭环 <span class="hint">OSV 每日增量 → 事件库 → Webhook</span></div>
+    <label class="f-label"><input type="checkbox" id="c-intel_enabled"> 启用每日情报（默认 21:30）</label>
+    <label class="f-label"><b>运行时间</b> intel_run_time</label>
+    <input type="time" id="c-intel_run_time">
+    <label class="f-label"><b>Webhook URL</b>（企业微信/飞书/通用）</label>
+    <input type="text" id="c-intel_webhook_url" placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...">
+    <label class="f-label"><b>Webhook 类型</b></label>
+    <select id="c-intel_webhook_type" class="mini">
+      <option value="wecom">企业微信</option>
+      <option value="feishu">飞书</option>
+      <option value="generic">通用 JSON</option>
+    </select>
+    <div style="margin-top:14px;display:flex;gap:10px">
+      <button class="btn btn-primary" id="btn-save-intel">保存情报配置</button>
+      <span class="muted" style="align-self:center;font-size:12px" id="intel-saved"></span>
+    </div>
+  </div>
+
   <!-- ==================== Agent 参数 ==================== -->
   <div class="card">
     <div class="card-title">Agent 引擎参数 <span class="hint">Config 表运行时可调</span></div>
@@ -41,12 +84,14 @@
       <input type="number" id="c-agent_token_budget" min="1">
       <label class="f-label"><b>全量审计轮次</b> full_audit_rounds <span class="muted">— Agent 自主遍历源码的轮数</span></label>
       <input type="number" id="c-full_audit_rounds" min="1">
+      <label class="f-label"><b>全量审计文件数熔断</b> full_audit_max_files <span class="muted">— 工作区文件数超过该值自动跳过全量审计（默认 500，实测千文件级仓库产出极低）</span></label>
+      <input type="number" id="c-full_audit_max_files" min="1">
       <label class="f-label"><b>每轮 token 预算</b> full_audit_token_per_round</label>
       <input type="number" id="c-full_audit_token_per_round" min="1">
       <label class="f-label"><b>每轮漏洞提交上限</b> full_audit_max_findings</label>
       <input type="number" id="c-full_audit_max_findings" min="1">
     </div>
-    <div class="tip-box" style="margin-top:16px"><b>成本提示</b>：参数越大挖得越深但 token 消耗越高。当前余额不足时 Agent 段会直接失败（402），任务会降级完成。</div>
+    <div class="tip-box" style="margin-top:16px"><b>成本提示</b>：参数越大挖得越深但 token 消耗越高。当前余额不足时 Agent 段会直接失败（402），任务会降级完成。文件数熔断触发后任务会跳过全量审计并在日志/任务页明确标注，仍保留静态结果与 Agent 研判。</div>
     <div style="margin-top:16px">
       <button class="btn btn-primary" id="btn-save-agent">保存 Agent 参数</button>
       <span class="muted" style="margin-left:10px;font-size:12px" id="agent-saved"></span>
@@ -59,7 +104,8 @@
 {% block scripts %}
 <script>
 const KEYS = ['agent_max_vulns', 'agent_max_steps', 'agent_concurrency', 'agent_token_budget',
-              'full_audit_rounds', 'full_audit_token_per_round', 'full_audit_max_findings'];
+              'full_audit_rounds', 'full_audit_token_per_round', 'full_audit_max_findings',
+              'full_audit_max_files'];
 
 async function load() {
   try {
@@ -67,6 +113,17 @@ async function load() {
     document.getElementById('c-base_url').value = c.base_url || '';
     document.getElementById('c-api_key').value = c.api_key || '';
     document.getElementById('c-model').value = c.model || '';
+    document.getElementById('c-night_enabled').checked = String(c.night_enabled) === '1';
+    document.getElementById('c-night_start').value = c.night_start || '23:00';
+    document.getElementById('c-night_end').value = c.night_end || '08:45';
+    document.getElementById('c-night_base_url').value = c.night_base_url || '';
+    document.getElementById('c-night_api_key').value = c.night_api_key || '';
+    document.getElementById('c-night_model').value = c.night_model || '';
+    document.getElementById('c-night_tz').value = c.night_tz || 'Asia/Shanghai';
+    document.getElementById('c-intel_enabled').checked = String(c.intel_enabled) === '1';
+    document.getElementById('c-intel_run_time').value = c.intel_run_time || '21:30';
+    document.getElementById('c-intel_webhook_url').value = c.intel_webhook_url || '';
+    document.getElementById('c-intel_webhook_type').value = c.intel_webhook_type || 'wecom';
     KEYS.forEach(k => document.getElementById('c-' + k).value = c[k]);
   } catch (e) { SAP.toast('读取配置失败：' + e.message, 'err'); }
 }
@@ -87,8 +144,23 @@ document.getElementById('btn-save-llm').addEventListener('click', async () => {
   } catch (e) { SAP.toast('保存失败：' + e.message, 'err'); }
 });
 
-document.getElementById('btn-save-agent').addEventListener('click', async () => {
-  const body = {};
+document.getElementById('btn-save-intel').addEventListener('click', async () => {
+  try {
+    await SAP.api('/api/config', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        intel_enabled: document.getElementById('c-intel_enabled').checked ? 1 : 0,
+        intel_run_time: document.getElementById('c-intel_run_time').value || '21:30',
+        intel_webhook_url: document.getElementById('c-intel_webhook_url').value.trim(),
+        intel_webhook_type: document.getElementById('c-intel_webhook_type').value
+      })
+    });
+    SAP.toast('情报配置已保存', 'ok');
+    document.getElementById('intel-saved').textContent = '已保存';
+  } catch (e) { SAP.toast('保存失败：' + e.message, 'err'); }
+});
+
+document.getElementById('btn-save-agent').addEventListener('click', async () => {  const body = {};
   let bad = null;
   KEYS.forEach(k => {
     const el = document.getElementById('c-' + k);
@@ -104,6 +176,26 @@ document.getElementById('btn-save-agent').addEventListener('click', async () => 
     });
     SAP.toast('Agent 参数已保存，新任务生效', 'ok');
     document.getElementById('agent-saved').textContent = '已保存';
+  } catch (e) { SAP.toast('保存失败：' + e.message, 'err'); }
+});
+
+document.getElementById('btn-save-night').addEventListener('click', async () => {
+  try {
+    await SAP.api('/api/config', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        night_enabled: document.getElementById('c-night_enabled').checked ? 1 : 0,
+        night_start: document.getElementById('c-night_start').value || '23:00',
+        night_end: document.getElementById('c-night_end').value || '08:45',
+        night_base_url: document.getElementById('c-night_base_url').value.trim(),
+        night_api_key: document.getElementById('c-night_api_key').value.trim(),
+        night_model: document.getElementById('c-night_model').value.trim(),
+        night_tz: document.getElementById('c-night_tz').value.trim() || 'Asia/Shanghai'
+      })
+    });
+    SAP.toast('夜间 LLM 配置已保存', 'ok');
+    document.getElementById('night-saved').textContent = '已保存';
+    load();
   } catch (e) { SAP.toast('保存失败：' + e.message, 'err'); }
 });
 

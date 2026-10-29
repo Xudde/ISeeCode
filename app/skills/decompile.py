@@ -1,8 +1,9 @@
-"""反编译 skill（升级阶段 2）：jar/apk/dex/dotnet/pyc/go 二进制 → 源码，失败降级字符串特征扫描"""
+"""反编译 skill（升级阶段 2）：jar/apk/dex/dotnet/pyc/原生 → 源码/伪 C，失败降级字符串特征扫描"""
 import hashlib
 import logging
 import os
 import shutil
+import struct
 import subprocess
 import zipfile
 from pathlib import Path
@@ -46,6 +47,42 @@ def tool_status() -> dict[str, bool]:
     }
 
 
+def _is_managed_pe(path: str) -> bool:
+    """判断 PE 是否含 CLR 元数据（.NET）；原生 exe/dll 不能交给 ilspycmd"""
+    try:
+        with open(path, "rb") as f:
+            if f.read(2) != b"MZ":
+                return False
+            f.seek(0x3C)
+            pe_off = struct.unpack("<I", f.read(4))[0]
+            f.seek(pe_off)
+            if f.read(4) != b"PE\0\0":
+                return False
+            coff = f.read(20)
+            if len(coff) < 20:
+                return False
+            opt_size = struct.unpack_from("<H", coff, 16)[0]
+            opt = f.read(opt_size)
+            if len(opt) < 2:
+                return False
+            magic = struct.unpack_from("<H", opt, 0)[0]
+            if magic == 0x10B:
+                dd_off, num_off = 96, 92
+            elif magic == 0x20B:
+                dd_off, num_off = 112, 108
+            else:
+                return False
+            if len(opt) < num_off + 4:
+                return False
+            num_dirs = struct.unpack_from("<I", opt, num_off)[0]
+            if num_dirs <= 14 or len(opt) < dd_off + 15 * 8:
+                return False
+            cli_rva, cli_size = struct.unpack_from("<II", opt, dd_off + 14 * 8)
+            return cli_rva != 0 and cli_size != 0
+    except (OSError, struct.error, ValueError):
+        return False
+
+
 def detect_kind(filename: str) -> str | None:
     """按扩展名判断反编译类型；None 表示不是反编译输入"""
     name = filename.lower()
@@ -54,7 +91,7 @@ def detect_kind(filename: str) -> str | None:
     if name.endswith((".apk", ".dex")):
         return "android"
     if name.endswith((".dll", ".exe")):
-        return "dotnet"
+        return "dotnet" if _is_managed_pe(filename) else "native"
     if name.endswith(".pyc"):
         return "python"
     if name.endswith((".so", ".elf", ".bin")):
@@ -139,9 +176,10 @@ def _unzip_safe(zip_path, dest) -> bool:
         return False
 
 
-def decompile(filepath: str, workspace: str, log_fn=None) -> dict:
+def decompile(filepath: str, workspace: str, log_fn=None, native_deep: bool = False) -> dict:
     """执行反编译。返回 {kind, lang, ok, degraded, info}
     产物写入 workspace/decompiled/。全部失败时 degraded=True（调用方走字符串特征降级）。
+    native_deep=True 时对原生 PE/ELF 用 Ghidra 导出伪 C（独立反编译任务用，避免批量过慢）。
     """
     log_fn = log_fn or (lambda m: None)
     kind = detect_kind(filepath)
@@ -183,7 +221,10 @@ def decompile(filepath: str, workspace: str, log_fn=None) -> dict:
         elif kind == "python":
             ok, info = _decompile_python(filepath, tmp_out, log_fn)
         elif kind == "native":
-            ok, info = False, "原生二进制不支持源码级反编译（ghidra 未启用）"
+            if native_deep:
+                ok, info = _decompile_native(filepath, tmp_out, log_fn)
+            else:
+                ok, info = False, "原生二进制需独立反编译任务（批量内嵌时仅做字符串降级）"
 
         result["ok"], result["info"] = ok, info
         if not ok:
@@ -195,6 +236,38 @@ def decompile(filepath: str, workspace: str, log_fn=None) -> dict:
         return result
     finally:
         shutil.rmtree(tmp_out, ignore_errors=True)
+
+
+def _decompile_native(path: str, out: Path, log_fn) -> tuple[bool, str]:
+    """原生 PE/ELF：复用 Ghidra headless 导出伪 C，供 semgrep/人工深挖"""
+    try:
+        with open(path, "rb") as f:
+            magic = f.read(4)
+        if not (magic[:2] == b"MZ" or magic == b"\x7fELF"):
+            return False, "非 PE/ELF 原生格式，Ghidra 不适用"
+    except OSError:
+        return False, "无法读取原生文件"
+    try:
+        from app.skills import driver_analyze
+        art = out / "_ghidra"
+        driver_analyze._ghidra_findings(path, Path(path).name, str(art), log_fn)
+        src = out / "src"
+        src.mkdir(parents=True, exist_ok=True)
+        copied = 0
+        for c in art.glob("*.c") if art.exists() else []:
+            try:
+                if c.stat().st_size < 500:
+                    continue
+            except OSError:
+                continue
+            shutil.copy2(c, src / c.name)
+            copied += 1
+        if copied:
+            log_fn(f"Ghidra 原生反编译产物 {copied} 个伪 C 文件（超时情况下也可能为部分产物）")
+            return True, f"Ghidra 伪 C 反编译 {copied} 个文件"
+    except Exception as e:
+        log_fn(f"Ghidra 原生反编译异常: {e}")
+    return False, "原生二进制 Ghidra 未导出伪 C"
 
 
 def _decompile_java(src: str, out: Path, log_fn) -> tuple[bool, str]:
@@ -256,25 +329,28 @@ def _decompile_dotnet(path: str, out: Path, log_fn) -> tuple[bool, str]:
     src_dir = out / "src"
     src_dir.mkdir(parents=True, exist_ok=True)
     # 1) 项目模式（每个类型单独 .cs）
-    rc, _ = _run(["ilspycmd", "-p", "-o", str(src_dir), path], timeout=600)
+    rc, detail = _run(["ilspycmd", "-p", "-o", str(src_dir), path], timeout=600)
     n = len(list(src_dir.rglob("*.cs"))) if src_dir.exists() else 0
     if rc == 0 and n > 0:
         log_fn(f"ilspycmd 反编译产物 {n} 个 cs 文件")
         return True, f"ilspycmd 反编译 {n} 个文件"
+    if detail:
+        log_fn(f"ilspycmd 项目模式失败 rc={rc}: {detail[-300:]}")
     # 2) 兜底：stdout 模式（整汇编源码写单个 .cs，不截断）
     try:
         proc = subprocess.run(["ilspycmd", path], capture_output=True,
                               text=True, timeout=600, errors="ignore")
         out_text = proc.stdout
+        detail2 = (proc.stderr or "")[-300:]
     except subprocess.TimeoutExpired:
-        out_text = ""
+        out_text, detail2 = "", "timeout"
     if out_text and not out_text.lstrip().startswith(("Usage:", "The directory")):
         (src_dir / (Path(path).stem + ".cs")).write_text(out_text, encoding="utf-8", errors="ignore")
         n2 = len(list(src_dir.rglob("*.cs")))
         log_fn(f"ilspycmd stdout 模式反编译产物 {n2} 个 cs 文件")
         return (n2 > 0), f"ilspycmd stdout 反编译 {n2} 个文件"
-    log_fn("ilspycmd 反编译失败")
-    return False, "ilspycmd 反编译失败"
+    log_fn("ilspycmd 反编译失败: %s" % (detail2 or detail or "无错误详情"))
+    return False, "ilspycmd 反编译失败: %s" % ((detail2 or detail or "无错误详情")[:240])
 
 
 def _decompile_python(path: str, out: Path, log_fn) -> tuple[bool, str]:
